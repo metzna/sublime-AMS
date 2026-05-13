@@ -1,0 +1,17 @@
+[
+    {
+        "keys": ["enter"],
+        "command": "sublime_review_accept",
+        "context": [{"key": "sublime_review_panel_focused"}]
+    },
+    {
+        "keys": ["escape"],
+        "command": "sublime_review_reject",
+        "context": [{"key": "sublime_review_panel_focused"}]
+    },
+    {
+        "keys": ["tab"],
+        "command": "sublime_review_next",
+        "context": [{"key": "sublime_review_panel_focused"}]
+    }
+]
