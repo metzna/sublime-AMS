@@ -312,6 +312,32 @@ async def ws_handler(websocket) -> None:
         }
     await websocket.send(json.dumps({"type": "lock_update", "locks": snapshot}))
 
+    # Resend any reviews still waiting for a decision
+    with state_lock:
+        pending = [
+            dict(r, queue_position=i+1, queue_total=len(review_queue))
+            for i, rid in enumerate(review_queue)
+            if rid in pending_reviews
+            for r in [pending_reviews[rid]]
+        ]
+    for review in pending:
+        msg = {
+            "type": "review_request",
+            "review_id": review.get("review_id"),
+            "session_id": review.get("session_id"),
+            "agent_label": review.get("agent_label"),
+            "tool_name": review.get("tool_name"),
+            "file_path": review.get("file_path"),
+            "old_string": review.get("old_string", ""),
+            "new_string": review.get("new_string", ""),
+            "content": review.get("content", ""),
+            "cwd": review.get("cwd", ""),
+            "queue_position": review.get("queue_position", 1),
+            "queue_total": review.get("queue_total", 1),
+        }
+        await websocket.send(json.dumps(msg))
+        log.info("Resent pending review %s to reconnected client", review.get("review_id"))
+
     try:
         async for raw in websocket:
             try:

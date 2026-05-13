@@ -589,3 +589,8 @@ class SublimeReviewPanelContext(sublime_plugin.EventListener):
         if operator == sublime.OP_NOT_EQUAL:
             return val != operand
         return None
+
+def plugin_unloaded():
+    for m in list(_managers.values()):
+        m.stop()
+    _managers.clear()
