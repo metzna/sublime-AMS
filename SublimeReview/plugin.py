@@ -340,26 +340,11 @@ class _LockIndicator(object):
             for v in self._window.views():
                 v.set_status("sublime_review", msg)
 
-    def _find(self, fp):
-        for v in self._window.views():
-            if v.file_name() == fp:
-                return v
-        return None
-
     def _lock(self, fp):
-        v = self._find(fp)
-        if v:
-            orig = v.name() or v.file_name() or fp
-            self._locked[fp] = orig
-            v.set_name("{0} {1}".format(_lock_icon(), orig))
-        else:
-            self._locked[fp] = None
+        self._locked[fp] = True
 
     def _unlock(self, fp):
-        orig = self._locked.pop(fp, None)
-        v    = self._find(fp)
-        if v:
-            v.set_name(orig if orig is not None else "")
+        self._locked.pop(fp, None)
 
 
 # ===============================================================================
