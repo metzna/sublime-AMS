@@ -219,7 +219,7 @@ def _build_diff(review):
 
 
 
-class _SublimeReviewSetContentCommand(sublime_plugin.TextCommand):
+class SublimeReviewSetContentCommand(sublime_plugin.TextCommand):
     """Internal command: replace entire view content."""
     def run(self, edit, text=""):
         self.view.replace(edit, sublime.Region(0, self.view.size()), text)
