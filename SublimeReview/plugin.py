@@ -293,6 +293,8 @@ class _ReviewPanel(object):
             v.set_read_only(False)
             v.run_command("sublime_review_set_content", {"text": text})
             v.set_read_only(True)
+            # Defer coloring so the view is fully rendered before add_regions runs
+            sublime.set_timeout(lambda: self._colorize(v), 30)
         except Exception as e:
             sublime.status_message("SublimeReview panel error: " + str(e))
 
@@ -321,6 +323,39 @@ class _ReviewPanel(object):
             v.add_regions("sr_del", del_regs, "markup.deleted", "", sublime.DRAW_NO_OUTLINE)
         if hdr_regs:
             v.add_regions("sr_hdr", hdr_regs, "markup.changed", "", sublime.DRAW_NO_OUTLINE)
+
+
+    def _colorize(self, v):
+        """Add green/red/grey region highlights to the diff lines.
+
+        Uses view.lines() to get regions from the live view content rather
+        than computing byte offsets manually, which avoids off-by-one errors
+        from differing line endings.  Flags=0 draws solid background colour
+        using the scope's colour scheme entry.
+        """
+        add_regs = []
+        del_regs = []
+        hdr_regs = []
+
+        for region in v.lines(sublime.Region(0, v.size())):
+            line = v.substr(region)
+            if line.startswith("+") and not line.startswith("+++"):
+                add_regs.append(region)
+            elif line.startswith("-") and not line.startswith("---"):
+                del_regs.append(region)
+            elif line.startswith(("@@", "---", "+++")):
+                hdr_regs.append(region)
+
+        v.erase_regions("sr_add")
+        v.erase_regions("sr_del")
+        v.erase_regions("sr_hdr")
+
+        if add_regs:
+            v.add_regions("sr_add", add_regs, "markup.inserted", "", 0)
+        if del_regs:
+            v.add_regions("sr_del", del_regs, "markup.deleted", "", 0)
+        if hdr_regs:
+            v.add_regions("sr_hdr", hdr_regs, "markup.changed", "", 0)
 
     def clear(self):
         try:
