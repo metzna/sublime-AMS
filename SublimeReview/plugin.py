@@ -18,10 +18,12 @@ import base64
 import difflib
 import hashlib
 import html as _html
+import http.client
 import json
 import os
 import socket
 import struct
+import subprocess
 import threading
 
 import sublime
@@ -459,6 +461,13 @@ class _LockIndicator(object):
 # ===============================================================================
 
 _managers = {}
+_server_proc = None
+
+# Absolute paths for hook commands — built from $HOME so they work for any user
+_HOOKS_DIR        = os.path.expanduser("~/.claude/hooks")
+_REVIEW_CMD       = "python3 " + os.path.join(_HOOKS_DIR, "sublime_review.py")
+_SESSION_END_CMD  = "python3 " + os.path.join(_HOOKS_DIR, "sublime_session_end.py")
+_SETTINGS_PATH    = os.path.expanduser("~/.claude/settings.json")
 
 
 def _manager(window=None):
@@ -472,6 +481,110 @@ def _manager(window=None):
         _managers[wid] = m
         m.start()
     return _managers[wid]
+
+
+def _start_server_if_needed():
+    global _server_proc
+    try:
+        conn = http.client.HTTPConnection("localhost", 9876, timeout=1)
+        conn.request("GET", "/status")
+        conn.getresponse()
+        return  # already running
+    except Exception:
+        pass
+    script = os.path.expanduser("~/.claude/sublime_review_server.py")
+    if not os.path.exists(script):
+        sublime.status_message("SublimeReview: server script not found: " + script)
+        return
+    try:
+        _server_proc = subprocess.Popen(
+            ["python3", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        sublime.status_message("SublimeReview: could not start server: " + str(e))
+
+
+def _first_hook_command(entry):
+    """Return the command string of the first hook in a hook-group entry."""
+    hooks = entry.get("hooks", [])
+    return hooks[0].get("command", "") if hooks else ""
+
+
+def _atomic_write_json(path, data):
+    """Write data as JSON to path atomically (write temp + rename)."""
+    import tempfile
+    dir_ = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=dir_, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        raise
+
+
+def _enable_hooks():
+    """Add SublimeReview hook entries to ~/.claude/settings.json if absent."""
+    try:
+        with open(_SETTINGS_PATH) as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+
+    hooks = data.setdefault("hooks", {})
+
+    pre = hooks.setdefault("PreToolUse", [])
+    if not any(_first_hook_command(e) == _REVIEW_CMD for e in pre):
+        pre.append({
+            "matcher": "Edit|Write|MultiEdit",
+            "hooks": [{"type": "command", "command": _REVIEW_CMD, "timeout": 300}],
+        })
+
+    end = hooks.setdefault("SessionEnd", [])
+    if not any(_first_hook_command(e) == _SESSION_END_CMD for e in end):
+        end.append({
+            "hooks": [{"type": "command", "command": _SESSION_END_CMD}],
+        })
+
+    try:
+        _atomic_write_json(_SETTINGS_PATH, data)
+    except Exception as e:
+        sublime.status_message("SublimeReview: could not write settings: " + str(e))
+
+
+def _disable_hooks():
+    """Remove SublimeReview hook entries from ~/.claude/settings.json."""
+    try:
+        with open(_SETTINGS_PATH) as f:
+            data = json.load(f)
+    except Exception:
+        return
+
+    hooks = data.get("hooks", {})
+    hooks["PreToolUse"] = [
+        e for e in hooks.get("PreToolUse", [])
+        if _first_hook_command(e) != _REVIEW_CMD
+    ]
+    hooks["SessionEnd"] = [
+        e for e in hooks.get("SessionEnd", [])
+        if _first_hook_command(e) != _SESSION_END_CMD
+    ]
+    for key in ("PreToolUse", "SessionEnd"):
+        if not hooks.get(key):
+            hooks.pop(key, None)
+    if not hooks:
+        data.pop("hooks", None)
+
+    try:
+        _atomic_write_json(_SETTINGS_PATH, data)
+    except Exception as e:
+        sublime.status_message("SublimeReview: could not write settings: " + str(e))
 
 
 class _Manager(object):
@@ -745,10 +858,23 @@ class SublimeReviewPanelContext(sublime_plugin.EventListener):
             return val != operand
         return None
 
+def plugin_loaded():
+    _start_server_if_needed()
+    _enable_hooks()
+
+
 # Called by Sublime when the plugin is unloaded (e.g. on plugin reload).
-# Closes all WebSocket connections so the server does not accumulate
-# stale client entries across reloads.
+# Closes all WebSocket connections, terminates the review server, and
+# removes the hook entries from ~/.claude/settings.json.
 def plugin_unloaded():
+    global _server_proc
+    _disable_hooks()
     for m in list(_managers.values()):
         m.stop()
     _managers.clear()
+    if _server_proc is not None:
+        try:
+            _server_proc.terminate()
+        except Exception:
+            pass
+        _server_proc = None
