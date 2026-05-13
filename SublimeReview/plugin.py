@@ -217,6 +217,13 @@ def _build_diff(review):
     return "".join(raw)
 
 
+
+
+class _SublimeReviewSetContentCommand(sublime_plugin.TextCommand):
+    """Internal command: replace entire view content."""
+    def run(self, edit, text=""):
+        self.view.replace(edit, sublime.Region(0, self.view.size()), text)
+
 class _ReviewPanel(object):
     def __init__(self, window):
         self._window = window
@@ -259,7 +266,7 @@ class _ReviewPanel(object):
                 diff=_build_diff(review),
             )
 
-            v.run_command("append", {"characters": text, "force": True})
+            v.run_command("sublime_review_set_content", {"text": text})
             v.set_read_only(True)
             v.settings().set("sublime_review_panel_focused", True)
             self._window.run_command("show_panel", {"panel": "output." + PANEL_NAME})
