@@ -217,7 +217,6 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 "review_id": review_id,
                 "agent_label": label,
                 "queued_at": time.time(),
-                "_decision_event": None,   # filled below (can't create asyncio.Event here)
                 "decision": None,
             }
             pending_reviews[review_id] = review_data
