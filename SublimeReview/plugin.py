@@ -483,10 +483,6 @@ class _Manager(object):
             self._ind.set_status(0)
             return
 
-        fp = review.get("file_path", "")
-        if fp and os.path.exists(fp):
-            self._window.open_file(fp, sublime.TRANSIENT)
-
         self._panel.show(review)
         self._refresh()
 
