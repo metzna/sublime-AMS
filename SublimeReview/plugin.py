@@ -197,7 +197,7 @@ class _WSClient(object):
 
 
 # ===============================================================================
-# Diff rendering (plain text only - no add_regions to avoid crashes)
+# Diff rendering
 # ===============================================================================
 
 PANEL_NAME = "sublime_review_diff"
@@ -297,32 +297,6 @@ class _ReviewPanel(object):
             sublime.set_timeout(lambda: self._colorize(v), 30)
         except Exception as e:
             sublime.status_message("SublimeReview panel error: " + str(e))
-
-
-    def _colorize(self, v, text):
-        add_regs = []
-        del_regs = []
-        hdr_regs = []
-        pos = 0
-        for line in text.split("\n"):
-            end = pos + len(line)
-            reg = sublime.Region(pos, end)
-            if line.startswith("+") and not line.startswith("+++"):
-                add_regs.append(reg)
-            elif line.startswith("-") and not line.startswith("---"):
-                del_regs.append(reg)
-            elif line.startswith(("@@", "---", "+++")):
-                hdr_regs.append(reg)
-            pos = end + 1
-        v.erase_regions("sr_add")
-        v.erase_regions("sr_del")
-        v.erase_regions("sr_hdr")
-        if add_regs:
-            v.add_regions("sr_add", add_regs, "markup.inserted", "", sublime.DRAW_NO_OUTLINE)
-        if del_regs:
-            v.add_regions("sr_del", del_regs, "markup.deleted", "", sublime.DRAW_NO_OUTLINE)
-        if hdr_regs:
-            v.add_regions("sr_hdr", hdr_regs, "markup.changed", "", sublime.DRAW_NO_OUTLINE)
 
 
     def _colorize(self, v):
