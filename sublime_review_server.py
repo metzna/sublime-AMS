@@ -132,11 +132,14 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
     def send_json(self, code: int, body: dict) -> None:
         data = json.dumps(body).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except BrokenPipeError:
+            log.warning("BrokenPipe sending response — hook process likely died before we responded")
 
     def read_body(self) -> dict:
         length = int(self.headers.get("Content-Length", 0))
