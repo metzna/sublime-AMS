@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 """
 Sublime Review Server
-Coordinates Claude Code PreToolUse reviews via HTTP (hook scripts) and WebSocket (Sublime plugin).
+=====================
+Coordinates Claude Code PreToolUse reviews via two transports:
 
-HTTP:  localhost:9876
-WS:    localhost:9877
+  HTTP  localhost:9876  — used by hook scripts (sublime_review.py).
+                          Each review is a blocking POST that returns only
+                          after the user accepts or rejects in Sublime.
+
+  WS    localhost:9877  — used by the Sublime Text plugin.
+                          Server pushes review_request messages; plugin
+                          pushes back review_decision messages.
+
+State is held entirely in memory and is lost on server restart.  This is
+intentional — locks and queued reviews are short-lived by design.
 """
 
 import asyncio
@@ -19,21 +28,28 @@ from typing import Optional
 import websockets
 
 # ─── Configuration ───────────────────────────────────────────────────────────
+# Adjust these at the top of the file; no restart needed for LOCK_TIMEOUT
+# (it is checked lazily), but HTTP/WS ports require a server restart.
 
-HTTP_PORT = 9876
-WS_PORT = 9877
-LOCK_TIMEOUT = 600          # 10 minutes
-REVIEW_TIMEOUT = 300        # 5 minutes (hook script timeout)
+HTTP_PORT = 9876       # hook scripts POST review requests here
+WS_PORT = 9877         # Sublime plugin connects via WebSocket here
+LOCK_TIMEOUT = 600     # seconds before an unresolved lock is force-released
+REVIEW_TIMEOUT = 300   # seconds before a pending review is auto-allowed
 LOG_FILE = "~/.claude/sublime_review_server.log"
 
 # ─── State (all guarded by state_lock) ───────────────────────────────────────
 
 state_lock = Lock()
 
+# file_path → lock info.  A lock is held from the moment a review is queued
+# until the user accepts/rejects, the session ends, or the lock times out.
 # {file_path: {"session_id": str, "agent_label": str, "locked_since": float}}
 locks: dict = {}
 
-# {review_id: {"event": asyncio.Event, "decision": str|None, ...review_data}}
+# review_id → review data + decision slot.
+# The hook script's polling loop watches review_data["decision"] until it
+# becomes non-None (set by WS message or timeout).
+# {review_id: {"decision": str|None, ...review_data}}
 pending_reviews: dict = {}
 
 # FIFO queue of review_ids awaiting Sublime

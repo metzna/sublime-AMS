@@ -1,5 +1,18 @@
-# SublimeReview - Claude Code review plugin for Sublime Text
-# Python 3.3 compatible (no type hints, no f-strings, no typing module)
+# SublimeReview – Claude Code review plugin for Sublime Text
+#
+# Shows a unified diff panel for every file edit Claude Code proposes.
+# The user presses Enter (accept) or Escape (reject) in the panel.
+#
+# Architecture:
+#   _WSClient      — minimal RFC 6455 WebSocket client (stdlib only, no deps)
+#   _ReviewPanel   — output panel that renders the diff as plain text
+#   _LockIndicator — status bar badge showing pending review count
+#   _Manager       — per-window coordinator: WS connection, review queue, decisions
+#   Commands       — SublimeReviewAccept/Reject/Next/UnlockFile/Connect
+#   Listeners      — SublimeReviewListener (lifecycle), SublimeReviewPanelContext (keybindings)
+#
+# Python 3.3 compatible: no type annotations, no f-strings, no typing module.
+# (Sublime Text 4 defaults to Python 3.3 for packages without .python-version.)
 
 import base64
 import difflib
@@ -190,6 +203,9 @@ class _WSClient(object):
 PANEL_NAME = "sublime_review_diff"
 
 
+# Build a unified diff string for the review payload.
+# For Write calls the entire new content is shown as additions (+).
+# For Edit/MultiEdit calls difflib produces a standard unified diff.
 def _build_diff(review):
     tool    = review.get("tool_name", "Edit")
     fp      = review.get("file_path", "")
@@ -376,6 +392,17 @@ def _manager(window=None):
 
 
 class _Manager(object):
+    """
+    Per-window coordinator.  One instance exists per Sublime window.
+
+    Responsibilities:
+      - Maintain the WebSocket connection to the review server.
+      - Queue incoming review_request messages (FIFO).
+      - Display one review at a time in the diff panel.
+      - Send review_decision messages back to the server.
+      - Handle review_cancelled messages from the server (auto-deny).
+    """
+
     def __init__(self, window):
         self._window  = window
         self._panel   = _ReviewPanel(window)
@@ -626,6 +653,9 @@ class SublimeReviewPanelContext(sublime_plugin.EventListener):
             return val != operand
         return None
 
+# Called by Sublime when the plugin is unloaded (e.g. on plugin reload).
+# Closes all WebSocket connections so the server does not accumulate
+# stale client entries across reloads.
 def plugin_unloaded():
     for m in list(_managers.values()):
         m.stop()
