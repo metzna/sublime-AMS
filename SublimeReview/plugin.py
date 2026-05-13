@@ -230,14 +230,13 @@ class _ReviewPanel(object):
         self._view   = None
 
     def _get_view(self):
-        if self._view is None or not self._view.is_valid():
-            v = self._window.create_output_panel(PANEL_NAME)
-            v.settings().set("sublime_review_panel", True)
-            v.settings().set("gutter", False)
-            v.settings().set("line_numbers", False)
-            v.settings().set("word_wrap", False)
-            self._view = v
-        return self._view
+        v = self._window.create_output_panel(PANEL_NAME)
+        v.settings().set("sublime_review_panel", True)
+        v.settings().set("gutter", False)
+        v.settings().set("line_numbers", False)
+        v.settings().set("word_wrap", False)
+        self._view = v
+        return v
 
     def show(self, review):
         try:
@@ -268,7 +267,6 @@ class _ReviewPanel(object):
 
             v.run_command("sublime_review_set_content", {"text": text})
             v.set_read_only(True)
-            self._colorize(v, text)
             v.settings().set("sublime_review_panel_focused", True)
             self._window.run_command("show_panel", {"panel": "output." + PANEL_NAME})
         except Exception as e:
