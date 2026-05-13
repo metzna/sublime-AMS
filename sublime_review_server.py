@@ -132,11 +132,14 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
     def send_json(self, code: int, body: dict) -> None:
         data = json.dumps(body).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except BrokenPipeError:
+            log.warning("BrokenPipe sending response — hook process likely died before we responded")
 
     def read_body(self) -> dict:
         length = int(self.headers.get("Content-Length", 0))
@@ -239,12 +242,28 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 log.info("Review %s timed out, auto-allowing", review_id)
                 break
 
-        # Cleanup
+        # Cleanup — and invalidate any queued reviews for the same file
+        # from other sessions so they get a clean deny instead of a stale edit error
+        invalidated = []
         with state_lock:
             pending_reviews.pop(review_id, None)
             if review_id in review_queue:
                 review_queue.remove(review_id)
             locks.pop(file_path, None)
+
+            if decision == "allow":
+                for rid in list(review_queue):
+                    r = pending_reviews.get(rid)
+                    if r and r.get("file_path") == file_path and r.get("session_id") != session_id:
+                        r["decision"] = "deny"
+                        r["reason"] = "file was modified by another agent while queued"
+                        invalidated.append(rid)
+
+        if invalidated:
+            log.info("Auto-denied %d stale review(s) for %s after accept", len(invalidated), file_path)
+            for rid in invalidated:
+                broadcast_ws({"type": "review_cancelled", "review_id": rid,
+                              "reason": "file was modified by another agent"})
 
         push_lock_update()
         _broadcast_queue_positions()
@@ -308,6 +327,32 @@ async def ws_handler(websocket) -> None:
             for fp, info in locks.items()
         }
     await websocket.send(json.dumps({"type": "lock_update", "locks": snapshot}))
+
+    # Resend any reviews still waiting for a decision
+    with state_lock:
+        pending = [
+            dict(r, queue_position=i+1, queue_total=len(review_queue))
+            for i, rid in enumerate(review_queue)
+            if rid in pending_reviews
+            for r in [pending_reviews[rid]]
+        ]
+    for review in pending:
+        msg = {
+            "type": "review_request",
+            "review_id": review.get("review_id"),
+            "session_id": review.get("session_id"),
+            "agent_label": review.get("agent_label"),
+            "tool_name": review.get("tool_name"),
+            "file_path": review.get("file_path"),
+            "old_string": review.get("old_string", ""),
+            "new_string": review.get("new_string", ""),
+            "content": review.get("content", ""),
+            "cwd": review.get("cwd", ""),
+            "queue_position": review.get("queue_position", 1),
+            "queue_total": review.get("queue_total", 1),
+        }
+        await websocket.send(json.dumps(msg))
+        log.info("Resent pending review %s to reconnected client", review.get("review_id"))
 
     try:
         async for raw in websocket:
