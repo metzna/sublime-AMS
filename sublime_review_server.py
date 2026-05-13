@@ -19,6 +19,8 @@ intentional — locks and queued reviews are short-lived by design.
 import asyncio
 import json
 import logging
+import os
+import tempfile
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -36,6 +38,80 @@ WS_PORT = 9877         # Sublime plugin connects via WebSocket here
 LOCK_TIMEOUT = 600     # seconds before an unresolved lock is force-released
 REVIEW_TIMEOUT = 300   # seconds before a pending review is auto-allowed
 LOG_FILE = "~/.claude/sublime_review_server.log"
+
+# ─── Hook management ─────────────────────────────────────────────────────────
+# Hooks are written into ~/.claude/settings.json when the first Sublime client
+# connects and removed when the last client disconnects.  This means reviews
+# only intercept Claude when Sublime Text is actually open — including after a
+# Sublime crash, because the WebSocket disconnect triggers _disable_hooks().
+
+_HOOKS_DIR       = os.path.expanduser("~/.claude/hooks")
+_REVIEW_CMD      = "python3 " + os.path.join(_HOOKS_DIR, "sublime_review.py")
+_SESSION_END_CMD = "python3 " + os.path.join(_HOOKS_DIR, "sublime_session_end.py")
+_SETTINGS_PATH   = os.path.expanduser("~/.claude/settings.json")
+
+
+def _first_hook_command(entry):
+    hooks = entry.get("hooks", [])
+    return hooks[0].get("command", "") if hooks else ""
+
+
+def _atomic_write_json(path, data):
+    dir_ = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=dir_, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        raise
+
+
+def _enable_hooks():
+    try:
+        with open(_SETTINGS_PATH) as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    hooks = data.setdefault("hooks", {})
+    pre = hooks.setdefault("PreToolUse", [])
+    if not any(_first_hook_command(e) == _REVIEW_CMD for e in pre):
+        pre.append({
+            "matcher": "Edit|Write|MultiEdit",
+            "hooks": [{"type": "command", "command": _REVIEW_CMD, "timeout": 300}],
+        })
+    end = hooks.setdefault("SessionEnd", [])
+    if not any(_first_hook_command(e) == _SESSION_END_CMD for e in end):
+        end.append({"hooks": [{"type": "command", "command": _SESSION_END_CMD}]})
+    _atomic_write_json(_SETTINGS_PATH, data)
+    log.info("Hooks enabled")
+
+
+def _disable_hooks():
+    try:
+        with open(_SETTINGS_PATH) as f:
+            data = json.load(f)
+    except Exception:
+        return
+    hooks = data.get("hooks", {})
+    hooks["PreToolUse"] = [
+        e for e in hooks.get("PreToolUse", []) if _first_hook_command(e) != _REVIEW_CMD
+    ]
+    hooks["SessionEnd"] = [
+        e for e in hooks.get("SessionEnd", []) if _first_hook_command(e) != _SESSION_END_CMD
+    ]
+    for key in ("PreToolUse", "SessionEnd"):
+        if not hooks.get(key):
+            hooks.pop(key, None)
+    if not hooks:
+        data.pop("hooks", None)
+    _atomic_write_json(_SETTINGS_PATH, data)
+    log.info("Hooks disabled")
+
 
 # ─── State (all guarded by state_lock) ───────────────────────────────────────
 
@@ -334,6 +410,8 @@ def _broadcast_queue_positions() -> None:
 async def ws_handler(websocket) -> None:
     ws_clients.add(websocket)
     log.info("Sublime connected (total clients: %d)", len(ws_clients))
+    if len(ws_clients) == 1:
+        _enable_hooks()
 
     # Send current state immediately
     with state_lock:
@@ -403,6 +481,8 @@ async def ws_handler(websocket) -> None:
     finally:
         ws_clients.discard(websocket)
         log.info("Sublime disconnected (total clients: %d)", len(ws_clients))
+        if len(ws_clients) == 0:
+            _disable_hooks()
 
 
 async def run_ws_server() -> None:
@@ -425,6 +505,7 @@ def lock_expiry_watchdog() -> None:
 
 def main() -> None:
     log.info("Starting Sublime Review Server")
+    _disable_hooks()  # clean up any hooks left over from a previous crash
 
     # WebSocket in its own thread with its own event loop
     def _ws_thread():
