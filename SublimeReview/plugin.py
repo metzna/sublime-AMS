@@ -17,6 +17,7 @@
 import base64
 import difflib
 import hashlib
+import html as _html
 import json
 import os
 import socket
@@ -233,6 +234,20 @@ def _build_diff(review):
     return "".join(raw)
 
 
+def _build_phantom_html(text):
+    lines = "".join(
+        '<div style="color:#2ea043;background:rgba(46,160,67,0.12);'
+        'font-family:monospace;white-space:pre;">{}</div>'.format(
+            _html.escape(ln)
+        )
+        for ln in (text.splitlines() or [""])
+    )
+    return (
+        '<body id="sr_new">'
+        '<div style="margin:2px 0;padding:4px 6px;'
+        'border-left:3px solid #2ea043;background:rgba(46,160,67,0.08);">'
+        '{}</div></body>'
+    ).format(lines)
 
 
 class SublimeReviewSetContentCommand(sublime_plugin.TextCommand):
@@ -255,7 +270,7 @@ class _ReviewPanel(object):
         self._view = v
         return v
 
-    def show(self, review):
+    def show(self, review, compact=False):
         try:
             # Show the panel first so find_output_panel returns the live view
             self._window.run_command("show_panel", {"panel": "output." + PANEL_NAME})
@@ -275,26 +290,30 @@ class _ReviewPanel(object):
             total = review.get("queue_total", 1)
             sep   = "-" * 60
 
-            text = (
+            header = (
                 "{sep}\n"
                 "  {agent}  |  {tool}  |  {pos}/{total} in queue\n"
                 "  {fp}\n"
                 "  [Enter] Accept   [Escape] Reject   [Tab] Next\n"
                 "{sep}\n"
-                "{diff}\n"
-            ).format(
-                sep=sep, agent=agent, tool=tool,
-                pos=pos, total=total, fp=fp,
-                diff=_build_diff(review),
-            )
+            ).format(sep=sep, agent=agent, tool=tool, pos=pos, total=total, fp=fp)
+
+            text = header if compact else header + _build_diff(review) + "\n"
 
             v.settings().set("sublime_review_panel", True)
             v.settings().set("sublime_review_panel_focused", True)
             v.set_read_only(False)
             v.run_command("sublime_review_set_content", {"text": text})
             v.set_read_only(True)
-            # Defer coloring so the view is fully rendered before add_regions runs
-            sublime.set_timeout(lambda: self._colorize(v), 30)
+
+            is_write = (tool == "Write")
+            if is_write and not compact:
+                v.assign_syntax("Packages/Diff/Diff.sublime-syntax")
+            else:
+                v.assign_syntax("Packages/Text/Plain text.tmLanguage")
+                if not compact:
+                    # Defer coloring so the view is fully rendered before add_regions runs
+                    sublime.set_timeout(lambda: self._colorize(v), 30)
         except Exception as e:
             sublime.status_message("SublimeReview panel error: " + str(e))
 
@@ -341,6 +360,61 @@ class _ReviewPanel(object):
             self._window.run_command("hide_panel", {"panel": "output." + PANEL_NAME})
         except Exception:
             pass
+
+
+# ===============================================================================
+# Inline diff (phantom-based, for Edit/MultiEdit)
+# ===============================================================================
+
+class _InlineDiff(object):
+    """
+    Shows the proposed change directly in the file view:
+      - old_string region highlighted red
+      - new_string rendered as a green HTML phantom below it
+    Returns True from show() if the inline display was set up successfully,
+    False if the file is not open or old_string was not found (caller falls
+    back to the full diff panel in that case).
+    """
+
+    def __init__(self, window):
+        self._window       = window
+        self._phantom_set  = None
+        self._phantom_view = None
+
+    def show(self, review):
+        fp  = review.get("file_path", "")
+        old = review.get("old_string", "")
+        new = review.get("new_string", "")
+
+        v = self._window.find_open_file(fp)
+        if v is None:
+            v = self._window.open_file(fp)
+        if v is None or v.is_loading():
+            return False
+
+        region = v.find(old, 0, sublime.LITERAL)
+        if region.a == -1:
+            return False
+
+        v.add_regions("sr_old", [region], "markup.deleted", "", 0)
+
+        self._phantom_view = v
+        self._phantom_set  = sublime.PhantomSet(v, "sr_new")
+        self._phantom_set.update([
+            sublime.Phantom(region, _build_phantom_html(new), sublime.LAYOUT_BELOW)
+        ])
+
+        self._window.focus_view(v)
+        v.show(region, True)
+        return True
+
+    def clear(self):
+        if self._phantom_set is not None:
+            self._phantom_set.update([])
+            self._phantom_set = None
+        if self._phantom_view is not None and self._phantom_view.is_valid():
+            self._phantom_view.erase_regions("sr_old")
+        self._phantom_view = None
 
 
 # ===============================================================================
@@ -415,6 +489,7 @@ class _Manager(object):
     def __init__(self, window):
         self._window  = window
         self._panel   = _ReviewPanel(window)
+        self._inline  = _InlineDiff(window)
         self._ind     = _LockIndicator(window)
         self._queue   = []
         self._active  = None
@@ -436,6 +511,7 @@ class _Manager(object):
             self._ws = None
         self._ind.clear()
         self._ind.set_status(0)
+        self._inline.clear()
         self._panel.clear()
 
     def _connect(self):
@@ -536,11 +612,18 @@ class _Manager(object):
             review = self._active
 
         if review is None:
+            self._inline.clear()
             self._panel.clear()
             self._ind.set_status(0)
             return
 
-        self._panel.show(review)
+        self._inline.clear()
+        tool = review.get("tool_name", "")
+        if tool in ("Edit", "MultiEdit"):
+            ok = self._inline.show(review)
+            self._panel.show(review, compact=ok)
+        else:
+            self._panel.show(review, compact=False)
         self._refresh()
 
     def _refresh(self):
