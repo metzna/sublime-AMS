@@ -228,13 +228,6 @@ manually dismisses it.  Pressing Enter or Escape on the stale panel is safe.
 Agent 2's Claude Code process receives the deny response from the server
 independently of the Sublime UI state.
 
-### Diff colors not available
-Syntax-highlighted diff colors (green additions / red deletions) are not
-rendered.  Attempts to use `view.add_regions()` for coloring caused Sublime
-Text to crash, likely due to the Python 3.3 plugin host.  The diff is
-displayed as plain monochrome text.  This may be revisited once the root cause
-is identified.
-
 ### Python 3.3 plugin host
 Sublime Text 4 loads packages in its bundled Python 3.3 interpreter by default
 (despite shipping a Python 3.8 host as well).  The `.python-version` file in
