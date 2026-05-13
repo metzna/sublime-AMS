@@ -268,10 +268,37 @@ class _ReviewPanel(object):
 
             v.run_command("sublime_review_set_content", {"text": text})
             v.set_read_only(True)
+            self._colorize(v, text)
             v.settings().set("sublime_review_panel_focused", True)
             self._window.run_command("show_panel", {"panel": "output." + PANEL_NAME})
         except Exception as e:
             sublime.status_message("SublimeReview panel error: " + str(e))
+
+
+    def _colorize(self, v, text):
+        add_regs = []
+        del_regs = []
+        hdr_regs = []
+        pos = 0
+        for line in text.split("\n"):
+            end = pos + len(line)
+            reg = sublime.Region(pos, end)
+            if line.startswith("+") and not line.startswith("+++"):
+                add_regs.append(reg)
+            elif line.startswith("-") and not line.startswith("---"):
+                del_regs.append(reg)
+            elif line.startswith(("@@", "---", "+++")):
+                hdr_regs.append(reg)
+            pos = end + 1
+        v.erase_regions("sr_add")
+        v.erase_regions("sr_del")
+        v.erase_regions("sr_hdr")
+        if add_regs:
+            v.add_regions("sr_add", add_regs, "markup.inserted", "", sublime.DRAW_NO_OUTLINE)
+        if del_regs:
+            v.add_regions("sr_del", del_regs, "markup.deleted", "", sublime.DRAW_NO_OUTLINE)
+        if hdr_regs:
+            v.add_regions("sr_hdr", hdr_regs, "markup.changed", "", sublime.DRAW_NO_OUTLINE)
 
     def clear(self):
         try:
