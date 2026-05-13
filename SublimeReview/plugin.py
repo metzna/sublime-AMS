@@ -240,10 +240,16 @@ class _ReviewPanel(object):
 
     def show(self, review):
         try:
-            v = self._get_view()
-            v.set_read_only(False)
-            v.run_command("select_all")
-            v.run_command("right_delete")
+            # Show the panel first so find_output_panel returns the live view
+            self._window.run_command("show_panel", {"panel": "output." + PANEL_NAME})
+            v = self._window.find_output_panel(PANEL_NAME)
+            if v is None:
+                self._get_view()
+                self._window.run_command("show_panel", {"panel": "output." + PANEL_NAME})
+                v = self._window.find_output_panel(PANEL_NAME)
+            if v is None:
+                sublime.status_message("SublimeReview: could not get panel view")
+                return
 
             agent = review.get("agent_label", "")
             tool  = review.get("tool_name", "")
@@ -265,10 +271,11 @@ class _ReviewPanel(object):
                 diff=_build_diff(review),
             )
 
+            v.settings().set("sublime_review_panel", True)
+            v.settings().set("sublime_review_panel_focused", True)
+            v.set_read_only(False)
             v.run_command("sublime_review_set_content", {"text": text})
             v.set_read_only(True)
-            v.settings().set("sublime_review_panel_focused", True)
-            self._window.run_command("show_panel", {"panel": "output." + PANEL_NAME})
         except Exception as e:
             sublime.status_message("SublimeReview panel error: " + str(e))
 
