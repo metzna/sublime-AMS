@@ -7,8 +7,6 @@ keybinding commands, and coordinates the panel + lock indicator.
 
 import threading
 import json
-import time
-import queue
 from typing import Optional
 
 import sublime
@@ -17,19 +15,12 @@ import sublime_plugin
 from . import settings as cfg
 from .review_panel import ReviewPanel
 from .lock_indicator import LockIndicator
-
-# Try to import websocket-client (websocket library for Sublime's Python env).
-# Falls back gracefully if not installed.
-try:
-    import websocket  # websocket-client package
-    _WS_AVAILABLE = True
-except ImportError:
-    _WS_AVAILABLE = False
+from .ws_client import WebSocketClient
 
 
 # ─── Global plugin state ──────────────────────────────────────────────────────
 
-_instances: dict[int, "ReviewManager"] = {}   # window_id → ReviewManager
+_instances: dict = {}   # window_id → ReviewManager
 
 
 def _get_manager(window: Optional[sublime.Window] = None) -> Optional["ReviewManager"]:
@@ -61,13 +52,11 @@ class ReviewManager:
         self._panel = ReviewPanel(window)
         self._indicator = LockIndicator(window)
 
-        # {review_id: review_data}
-        self._queue: list[dict] = []
-        self._active_review: Optional[dict] = None
+        self._queue = []          # list of review dicts
+        self._active_review = None
         self._lock = threading.Lock()
 
-        self._ws: Optional["websocket.WebSocketApp"] = None
-        self._ws_thread: Optional[threading.Thread] = None
+        self._ws: Optional[WebSocketClient] = None
         self._running = False
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -83,6 +72,7 @@ class ReviewManager:
                 self._ws.close()
             except Exception:
                 pass
+            self._ws = None
         self._indicator.clear_all()
         self._indicator.clear_status()
         self._panel.clear()
@@ -90,35 +80,37 @@ class ReviewManager:
     # ── WebSocket ─────────────────────────────────────────────────────────────
 
     def _connect(self) -> None:
-        if not _WS_AVAILABLE:
-            sublime.status_message(
-                "SublimeReview: websocket-client not installed. "
-                "Run: pip install websocket-client"
-            )
-            return
-
         host = cfg.server_host()
         port = cfg.server_port()
         url = f"ws://{host}:{port}"
 
-        self._ws = websocket.WebSocketApp(
+        self._ws = WebSocketClient(
             url,
-            on_open=self._on_open,
             on_message=self._on_message,
-            on_error=self._on_error,
+            on_open=self._on_open,
             on_close=self._on_close,
+            on_error=self._on_error,
         )
-        self._ws_thread = threading.Thread(
-            target=self._ws.run_forever,
-            kwargs={"ping_interval": 30, "ping_timeout": 10},
-            daemon=True,
+
+        def _try_connect():
+            try:
+                self._ws.connect()
+            except Exception as e:
+                sublime.set_timeout(
+                    lambda: sublime.status_message(f"SublimeReview: connection failed — {e}"), 0
+                )
+                if self._running and cfg.auto_reconnect():
+                    delay = cfg.reconnect_delay() * 1000
+                    sublime.set_timeout_async(self._reconnect, delay)
+
+        threading.Thread(target=_try_connect, daemon=True).start()
+
+    def _on_open(self) -> None:
+        sublime.set_timeout(
+            lambda: sublime.status_message("SublimeReview: connected to review server"), 0
         )
-        self._ws_thread.start()
 
-    def _on_open(self, ws) -> None:
-        sublime.status_message("SublimeReview: connected to review server")
-
-    def _on_message(self, ws, raw: str) -> None:
+    def _on_message(self, raw: str) -> None:
         try:
             msg = json.loads(raw)
         except Exception:
@@ -137,15 +129,17 @@ class ReviewManager:
             total = msg.get("queue_total", 0)
             sublime.set_timeout(lambda: self._update_status_bar(total), 0)
 
-    def _on_error(self, ws, error) -> None:
-        pass   # logged by on_close reconnect logic
+    def _on_error(self, error: Exception) -> None:
+        sublime.set_timeout(
+            lambda: sublime.status_message(f"SublimeReview: WS error — {error}"), 0
+        )
 
-    def _on_close(self, ws, code, reason) -> None:
+    def _on_close(self) -> None:
         if not self._running:
             return
         if cfg.auto_reconnect():
-            delay = cfg.reconnect_delay()
-            sublime.set_timeout_async(self._reconnect, delay * 1000)
+            delay = cfg.reconnect_delay() * 1000
+            sublime.set_timeout_async(self._reconnect, delay)
 
     def _reconnect(self) -> None:
         if not self._running:
@@ -163,7 +157,7 @@ class ReviewManager:
                 self._refresh_status()
 
     def _show_next_review(self) -> None:
-        """Show the next review from the queue. Must be called from main thread."""
+        """Show the next review from the queue. Must be called from the main thread."""
         with self._lock:
             if not self._queue:
                 self._active_review = None
@@ -175,7 +169,6 @@ class ReviewManager:
         review = self._active_review
         file_path = review.get("file_path", "")
 
-        # Open the file being reviewed
         if file_path:
             self._window.open_file(file_path, sublime.TRANSIENT)
 
@@ -210,15 +203,13 @@ class ReviewManager:
 
         review_id = review.get("review_id")
         self._send({"type": "review_decision", "review_id": review_id, "decision": decision})
-
         sublime.set_timeout(self._show_next_review, 0)
 
     def next_review(self) -> None:
-        """Cycle to the next queued review without deciding (for Tab key)."""
+        """Cycle to the next queued review without deciding (Tab key)."""
         with self._lock:
             if not self._queue:
                 return
-            # Push active back to end of queue
             if self._active_review:
                 self._queue.append(self._active_review)
             self._active_review = None
@@ -234,7 +225,9 @@ class ReviewManager:
             try:
                 self._ws.send(json.dumps(msg))
             except Exception as e:
-                sublime.status_message(f"SublimeReview: send error: {e}")
+                sublime.set_timeout(
+                    lambda: sublime.status_message(f"SublimeReview: send error — {e}"), 0
+                )
 
 
 # ─── Sublime Commands ─────────────────────────────────────────────────────────
@@ -262,7 +255,7 @@ class SublimeReviewNextCommand(sublime_plugin.WindowCommand):
 
 class SublimeReviewUnlockFileCommand(sublime_plugin.WindowCommand):
     """Command palette: manually unlock a file."""
-    def run(self, file_path: str = ""):
+    def run(self, file_path=""):
         if not file_path:
             view = self.window.active_view()
             file_path = view.file_name() if view else ""
@@ -291,7 +284,7 @@ class SublimeReviewListener(sublime_plugin.EventListener):
     def on_activated(self, view: sublime.View) -> None:
         window = view.window()
         if window:
-            _get_manager(window)    # ensure manager exists for this window
+            _get_manager(window)
 
     def on_pre_close_window(self, window: sublime.Window) -> None:
         wid = window.id()
