@@ -261,6 +261,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
         if invalidated:
             log.info("Auto-denied %d stale review(s) for %s after accept", len(invalidated), file_path)
+            for rid in invalidated:
+                broadcast_ws({"type": "review_cancelled", "review_id": rid,
+                              "reason": "file was modified by another agent"})
 
         push_lock_update()
         _broadcast_queue_positions()

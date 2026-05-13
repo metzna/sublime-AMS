@@ -434,6 +434,9 @@ class _Manager(object):
         t = msg.get("type")
         if t == "review_request":
             sublime.set_timeout(lambda: self._enqueue(msg), 0)
+        elif t == "review_cancelled":
+            rid = msg.get("review_id")
+            sublime.set_timeout(lambda: self._cancel(rid), 0)
         elif t == "lock_update":
             lk = msg.get("locks", {})
             sublime.set_timeout(lambda: self._ind.apply(lk), 0)
@@ -458,6 +461,23 @@ class _Manager(object):
             self._queue.append(review)
             has_active = self._active is not None
         if not has_active:
+            self._next()
+        else:
+            self._refresh()
+
+    def _cancel(self, review_id):
+        with self._mu:
+            # Remove from queue if waiting
+            self._queue = [r for r in self._queue if r.get("review_id") != review_id]
+            # If it's the active review, move on
+            cancelled_active = (
+                self._active is not None and
+                self._active.get("review_id") == review_id
+            )
+            if cancelled_active:
+                self._active = None
+        if cancelled_active:
+            sublime.status_message("SublimeReview: review cancelled (file modified by another agent)")
             self._next()
         else:
             self._refresh()
