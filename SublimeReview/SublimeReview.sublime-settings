@@ -1,0 +1,21 @@
+{
+    // WebSocket server address
+    "server_host": "localhost",
+    "server_port": 9877,
+
+    // Automatically reconnect when the connection drops
+    "auto_reconnect": true,
+    "reconnect_delay": 3,
+
+    // Review panel position: "bottom" or "right"
+    "panel_position": "bottom",
+
+    // Number of context lines shown around each diff hunk
+    "diff_context_lines": 3,
+
+    // Status bar prefix shown for pending reviews
+    "status_bar_prefix": "Claude Review",
+
+    // Lock icon shown in tab name
+    "lock_icon": "🔒"
+}
