@@ -222,7 +222,8 @@ def _build_diff(review):
 class SublimeReviewSetContentCommand(sublime_plugin.TextCommand):
     """Internal command: replace entire view content."""
     def run(self, edit, text=""):
-        self.view.replace(edit, sublime.Region(0, self.view.size()), text)
+        self.view.erase(edit, sublime.Region(0, self.view.size()))
+        self.view.insert(edit, 0, text)
 
 class _ReviewPanel(object):
     def __init__(self, window):
@@ -467,23 +468,31 @@ class _Manager(object):
 
     def _cancel(self, review_id):
         with self._mu:
-            # Remove from queue if waiting
             self._queue = [r for r in self._queue if r.get("review_id") != review_id]
-            # If it's the active review, move on
             cancelled_active = (
                 self._active is not None and
                 self._active.get("review_id") == review_id
             )
             if cancelled_active:
                 self._active = None
+            else:
+                # Mark so _next() skips it if it arrives late
+                _Manager._cancelled_ids.add(review_id)
         if cancelled_active:
-            sublime.status_message("SublimeReview: review cancelled (file modified by another agent)")
+            sublime.status_message("SublimeReview: cancelled — file modified by another agent")
             self._next()
         else:
             self._refresh()
 
+    # Reviews cancelled by the server before they reach active state
+    _cancelled_ids = set()
+
     def _next(self):
         with self._mu:
+            # Skip over any reviews that were cancelled while queued
+            while self._queue and self._queue[0].get("review_id") in _Manager._cancelled_ids:
+                _Manager._cancelled_ids.discard(self._queue[0].get("review_id"))
+                self._queue.pop(0)
             if not self._queue:
                 self._active = None
             else:
