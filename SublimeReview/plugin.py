@@ -594,6 +594,7 @@ class _Manager(object):
 
     def _reconnect(self):
         if self._running:
+            _start_server_if_needed()
             self._connect()
 
     def _enqueue(self, review):
