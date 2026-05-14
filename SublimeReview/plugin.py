@@ -256,25 +256,20 @@ def _build_diff(review):
     return "".join(raw)
 
 
-def _build_phantom_html(text, color):
-    r = int(color[1:3], 16)
-    g = int(color[3:5], 16)
-    b = int(color[5:7], 16)
-    line_bg  = "rgba({},{},{},0.12)".format(r, g, b)
-    block_bg = "rgba({},{},{},0.08)".format(r, g, b)
+def _build_phantom_html(text):
     lines = "".join(
-        '<div style="color:{c};background:{bg};'
-        'font-family:monospace;white-space:pre-wrap;word-break:break-all;">{t}</div>'.format(
-            c=color, bg=line_bg, t=_html.escape(ln)
+        '<div style="color:#2ea043;background:rgba(46,160,67,0.12);'
+        'font-family:monospace;white-space:pre-wrap;word-break:break-all;">{}</div>'.format(
+            _html.escape(ln)
         )
         for ln in (text.splitlines() or [""])
     )
     return (
         '<body id="sr_new">'
         '<div style="margin:2px 0;padding:4px 6px;'
-        'border-left:3px solid {c};background:{bg};">'
-        '{lines}</div></body>'
-    ).format(c=color, bg=block_bg, lines=lines)
+        'border-left:3px solid #2ea043;background:rgba(46,160,67,0.08);">'
+        '{}</div></body>'
+    ).format(lines)
 
 
 class SublimeReviewSetContentCommand(sublime_plugin.TextCommand):
@@ -417,10 +412,9 @@ class _InlineDiff(object):
         self._phantom_view = None
 
     def show(self, review):
-        fp    = review.get("file_path", "")
-        old   = review.get("old_string", "")
-        new   = review.get("new_string", "")
-        color = _agent_color(review.get("session_id", ""))
+        fp  = review.get("file_path", "")
+        old = review.get("old_string", "")
+        new = review.get("new_string", "")
 
         v = self._window.find_open_file(fp)
         if v is None:
@@ -445,7 +439,7 @@ class _InlineDiff(object):
         if end_pt > 0 and v.substr(end_pt - 1) == "\n":
             end_pt -= 1
         self._phantom_set.update([
-            sublime.Phantom(sublime.Region(end_pt), _build_phantom_html(new, color), sublime.LAYOUT_BLOCK)
+            sublime.Phantom(sublime.Region(end_pt), _build_phantom_html(new), sublime.LAYOUT_BLOCK)
         ])
 
         self._window.focus_view(v)
