@@ -346,12 +346,12 @@ class _ReviewPanel(object):
         v.erase_regions("sr_del")
         v.erase_regions("sr_hdr")
 
-        if add_regs:
-            v.add_regions("sr_add", add_regs, "markup.inserted", "", 0)
-        if del_regs:
-            v.add_regions("sr_del", del_regs, "markup.deleted", "", 0)
         if hdr_regs:
             v.add_regions("sr_hdr", hdr_regs, "markup.changed", "", 0)
+        if del_regs:
+            v.add_regions("sr_del", del_regs, "markup.deleted", "", 0)
+        if add_regs:
+            v.add_regions("sr_add", add_regs, "markup.inserted", "", 0)
 
     def clear(self):
         try:
@@ -404,8 +404,15 @@ class _InlineDiff(object):
 
         self._phantom_view = v
         self._phantom_set  = sublime.PhantomSet(v, "sr_new")
+        # Zero-width anchor on the last line of the deleted region.
+        # LAYOUT_BLOCK anchors to the line containing region.begin(), so we
+        # pass a point at region.end(). If the old_string captured a trailing
+        # newline, region.end() sits on the next line — step back one char.
+        end_pt = region.end()
+        if end_pt > 0 and v.substr(end_pt - 1) == "\n":
+            end_pt -= 1
         self._phantom_set.update([
-            sublime.Phantom(region, _build_phantom_html(new), sublime.LAYOUT_BELOW)
+            sublime.Phantom(sublime.Region(end_pt), _build_phantom_html(new), sublime.LAYOUT_BLOCK)
         ])
 
         self._window.focus_view(v)
