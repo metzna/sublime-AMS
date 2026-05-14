@@ -325,9 +325,12 @@ class ReviewHandler(BaseHTTPRequestHandler):
         # Block until decision or timeout
         _ev.wait(timeout=REVIEW_TIMEOUT)
         with state_lock:
-            decision = pending_reviews.get(review_id, {}).get("decision")
+            _rev = pending_reviews.get(review_id, {})
+            decision = _rev.get("decision")
+            reason   = _rev.get("reason", "")
         if decision is None:
             decision = "allow"
+            reason   = ""
             log.info("Review %s timed out, auto-allowing", review_id)
 
         # Cleanup — and invalidate any queued reviews for the same file
@@ -360,7 +363,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
         _broadcast_queue_positions()
 
         log.info("Review %s decision=%s", review_id, decision)
-        self.send_json(200, {"decision": decision})
+        self.send_json(200, {"decision": decision, "reason": reason})
 
     # ── /unlock_session ───────────────────────────────────────────────────────
 
@@ -460,11 +463,14 @@ async def ws_handler(websocket) -> None:
             if msg_type == "review_decision":
                 review_id = msg.get("review_id")
                 decision = msg.get("decision")
+                reason = msg.get("reason", "")
                 log.info("WS decision: review=%s decision=%s", review_id, decision)
                 ev = None
                 with state_lock:
                     if review_id in pending_reviews:
                         pending_reviews[review_id]["decision"] = decision
+                        if reason:
+                            pending_reviews[review_id]["reason"] = reason
                         ev = pending_reviews[review_id].get("_event")
                 if ev is not None:
                     ev.set()

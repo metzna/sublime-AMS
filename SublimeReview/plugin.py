@@ -673,19 +673,22 @@ class _Manager(object):
     def accept(self):
         self._decide("allow")
 
-    def reject(self):
-        self._decide("deny")
+    def reject(self, reason=""):
+        self._decide("deny", reason)
 
-    def _decide(self, decision):
+    def _decide(self, decision, reason=""):
         with self._mu:
             review = self._active
         if review is None:
             return
-        self._send({
+        msg = {
             "type": "review_decision",
             "review_id": review.get("review_id"),
             "decision": decision,
-        })
+        }
+        if reason:
+            msg["reason"] = reason
+        self._send(msg)
         sublime.set_timeout(self._next, 0)
 
     def cycle(self):
@@ -723,8 +726,15 @@ class SublimeReviewAcceptCommand(sublime_plugin.WindowCommand):
 class SublimeReviewRejectCommand(sublime_plugin.WindowCommand):
     def run(self):
         m = _manager(self.window)
-        if m:
-            m.reject()
+        if not m:
+            return
+        self.window.show_input_panel(
+            "Rejection reason (optional, Enter to confirm, Escape to skip):",
+            "",
+            lambda reason: m.reject(reason.strip()),  # Enter
+            None,
+            lambda: m.reject(""),                     # Escape
+        )
 
 
 class SublimeReviewNextCommand(sublime_plugin.WindowCommand):
