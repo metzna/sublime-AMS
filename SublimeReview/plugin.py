@@ -239,7 +239,7 @@ def _build_diff(review):
 def _build_phantom_html(text):
     lines = "".join(
         '<div style="color:#2ea043;background:rgba(46,160,67,0.12);'
-        'font-family:monospace;white-space:pre;">{}</div>'.format(
+        'font-family:monospace;white-space:pre-wrap;word-break:break-all;">{}</div>'.format(
             _html.escape(ln)
         )
         for ln in (text.splitlines() or [""])
@@ -525,15 +525,16 @@ class _Manager(object):
     """
 
     def __init__(self, window):
-        self._window  = window
-        self._panel   = _ReviewPanel(window)
-        self._inline  = _InlineDiff(window)
-        self._ind     = _LockIndicator(window)
-        self._queue   = []
-        self._active  = None
-        self._mu      = threading.Lock()
-        self._ws      = None
-        self._running = False
+        self._window        = window
+        self._panel         = _ReviewPanel(window)
+        self._inline        = _InlineDiff(window)
+        self._ind           = _LockIndicator(window)
+        self._queue         = []
+        self._active        = None
+        self._mu            = threading.Lock()
+        self._ws            = None
+        self._running       = False
+        self._cancelled_ids = set()
 
     def start(self):
         self._running = True
@@ -551,6 +552,7 @@ class _Manager(object):
         self._ind.set_status(0)
         self._inline.clear()
         self._panel.clear()
+        self._cancelled_ids.clear()
 
     def _connect(self):
         url = "ws://{0}:{1}".format(_host(), _port())
@@ -628,21 +630,18 @@ class _Manager(object):
                 self._active = None
             else:
                 # Mark so _next() skips it if it arrives late
-                _Manager._cancelled_ids.add(review_id)
+                self._cancelled_ids.add(review_id)
         if cancelled_active:
             sublime.status_message("SublimeReview: cancelled — file modified by another agent")
             self._next()
         else:
             self._refresh()
 
-    # Reviews cancelled by the server before they reach active state
-    _cancelled_ids = set()
-
     def _next(self):
         with self._mu:
             # Skip over any reviews that were cancelled while queued
-            while self._queue and self._queue[0].get("review_id") in _Manager._cancelled_ids:
-                _Manager._cancelled_ids.discard(self._queue[0].get("review_id"))
+            while self._queue and self._queue[0].get("review_id") in self._cancelled_ids:
+                self._cancelled_ids.discard(self._queue[0].get("review_id"))
                 self._queue.pop(0)
             if not self._queue:
                 self._active = None
