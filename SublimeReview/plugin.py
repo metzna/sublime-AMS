@@ -206,6 +206,26 @@ class _WSClient(object):
 PANEL_NAME = "sublime_review_diff"
 
 
+def _agent_color(session_id):
+    """Derive a stable accent color from a session ID via HSL with fixed S/L."""
+    digest = hashlib.md5(session_id.encode("utf-8")).digest()
+    hue = ((digest[0] << 8) | digest[1]) / 65536.0 * 360.0
+    s, l = 0.70, 0.62  # vivid, readable on dark backgrounds
+    c = (1.0 - abs(2.0 * l - 1.0)) * s
+    x = c * (1.0 - abs((hue / 60.0) % 2.0 - 1.0))
+    m = l - c / 2.0
+    h = int(hue / 60) % 6
+    if   h == 0: r, g, b = c, x, 0.0
+    elif h == 1: r, g, b = x, c, 0.0
+    elif h == 2: r, g, b = 0.0, c, x
+    elif h == 3: r, g, b = 0.0, x, c
+    elif h == 4: r, g, b = x, 0.0, c
+    else:        r, g, b = c, 0.0, x
+    return "#{:02x}{:02x}{:02x}".format(
+        int((r + m) * 255), int((g + m) * 255), int((b + m) * 255)
+    )
+
+
 # Build a unified diff string for the review payload.
 # For Write calls the entire new content is shown as additions (+).
 # For Edit/MultiEdit calls difflib produces a standard unified diff.
@@ -236,20 +256,25 @@ def _build_diff(review):
     return "".join(raw)
 
 
-def _build_phantom_html(text):
+def _build_phantom_html(text, color):
+    r = int(color[1:3], 16)
+    g = int(color[3:5], 16)
+    b = int(color[5:7], 16)
+    line_bg  = "rgba({},{},{},0.12)".format(r, g, b)
+    block_bg = "rgba({},{},{},0.08)".format(r, g, b)
     lines = "".join(
-        '<div style="color:#2ea043;background:rgba(46,160,67,0.12);'
-        'font-family:monospace;white-space:pre-wrap;word-break:break-all;">{}</div>'.format(
-            _html.escape(ln)
+        '<div style="color:{c};background:{bg};'
+        'font-family:monospace;white-space:pre-wrap;word-break:break-all;">{t}</div>'.format(
+            c=color, bg=line_bg, t=_html.escape(ln)
         )
         for ln in (text.splitlines() or [""])
     )
     return (
         '<body id="sr_new">'
         '<div style="margin:2px 0;padding:4px 6px;'
-        'border-left:3px solid #2ea043;background:rgba(46,160,67,0.08);">'
-        '{}</div></body>'
-    ).format(lines)
+        'border-left:3px solid {c};background:{bg};">'
+        '{lines}</div></body>'
+    ).format(c=color, bg=block_bg, lines=lines)
 
 
 class SublimeReviewSetContentCommand(sublime_plugin.TextCommand):
@@ -285,12 +310,13 @@ class _ReviewPanel(object):
                 sublime.status_message("SublimeReview: could not get panel view")
                 return
 
-            agent = review.get("agent_label", "")
-            tool  = review.get("tool_name", "")
-            fp    = review.get("file_path", "")
-            pos   = review.get("queue_position", 1)
-            total = review.get("queue_total", 1)
-            sep   = "-" * 60
+            agent   = review.get("agent_label", "")
+            tool    = review.get("tool_name", "")
+            fp      = review.get("file_path", "")
+            pos     = review.get("queue_position", 1)
+            total   = review.get("queue_total", 1)
+            color   = _agent_color(review.get("session_id", ""))
+            sep     = "-" * 60
 
             header = (
                 "{sep}\n"
@@ -308,6 +334,12 @@ class _ReviewPanel(object):
             v.run_command("sublime_review_set_content", {"text": text})
             v.set_read_only(True)
             v.show(0)
+
+            agent_region = v.find(agent, 0, sublime.LITERAL)
+            if agent_region.a != -1:
+                v.add_regions("sr_agent", [agent_region], "", "",
+                              sublime.DRAW_NO_FILL | sublime.DRAW_NO_OUTLINE,
+                              annotations=[agent], annotation_color=color)
 
             is_write = (tool == "Write")
             if is_write and not compact:
@@ -385,9 +417,10 @@ class _InlineDiff(object):
         self._phantom_view = None
 
     def show(self, review):
-        fp  = review.get("file_path", "")
-        old = review.get("old_string", "")
-        new = review.get("new_string", "")
+        fp    = review.get("file_path", "")
+        old   = review.get("old_string", "")
+        new   = review.get("new_string", "")
+        color = _agent_color(review.get("session_id", ""))
 
         v = self._window.find_open_file(fp)
         if v is None:
@@ -412,7 +445,7 @@ class _InlineDiff(object):
         if end_pt > 0 and v.substr(end_pt - 1) == "\n":
             end_pt -= 1
         self._phantom_set.update([
-            sublime.Phantom(sublime.Region(end_pt), _build_phantom_html(new), sublime.LAYOUT_BLOCK)
+            sublime.Phantom(sublime.Region(end_pt), _build_phantom_html(new, color), sublime.LAYOUT_BLOCK)
         ])
 
         self._window.focus_view(v)
