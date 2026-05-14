@@ -394,9 +394,10 @@ class _InlineDiff(object):
         if v is None or v.is_loading():
             return False
 
-        region = v.find(old, 0, sublime.LITERAL)
-        if region.a == -1:
+        regions = v.find_all(old, sublime.LITERAL)
+        if not regions or len(regions) > 1:
             return False
+        region = regions[0]
 
         v.add_regions("sr_old", [region], "markup.deleted", "", 0)
 
@@ -462,6 +463,7 @@ class _LockIndicator(object):
 
 _managers = {}
 _server_proc = None
+_server_start_lock = threading.Lock()
 
 
 def _manager(window=None):
@@ -479,25 +481,26 @@ def _manager(window=None):
 
 def _start_server_if_needed():
     global _server_proc
-    try:
-        conn = http.client.HTTPConnection("localhost", 9876, timeout=1)
-        conn.request("GET", "/status")
-        conn.getresponse()
-        return  # already running
-    except Exception:
-        pass
-    script = os.path.expanduser("~/.claude/sublime_review_server.py")
-    if not os.path.exists(script):
-        sublime.status_message("SublimeReview: server script not found: " + script)
-        return
-    try:
-        _server_proc = subprocess.Popen(
-            ["python3", script],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception as e:
-        sublime.status_message("SublimeReview: could not start server: " + str(e))
+    with _server_start_lock:
+        try:
+            conn = http.client.HTTPConnection("localhost", 9876, timeout=1)
+            conn.request("GET", "/status")
+            conn.getresponse()
+            return  # already running
+        except Exception:
+            pass
+        script = os.path.expanduser("~/.claude/sublime_review_server.py")
+        if not os.path.exists(script):
+            sublime.status_message("SublimeReview: server script not found: " + script)
+            return
+        try:
+            _server_proc = subprocess.Popen(
+                ["python3", script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            sublime.status_message("SublimeReview: could not start server: " + str(e))
 
 
 

@@ -23,8 +23,8 @@ import os
 import tempfile
 import time
 import uuid
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from threading import Thread, Lock
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+from threading import Thread, Lock, Event
 from typing import Optional
 
 import websockets
@@ -288,12 +288,14 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 "locked_since": time.time(),
             }
             review_id = str(uuid.uuid4())
+            _ev = Event()
             review_data = {
                 **body,
                 "review_id": review_id,
                 "agent_label": label,
                 "queued_at": time.time(),
                 "decision": None,
+                "_event": _ev,
             }
             pending_reviews[review_id] = review_data
             review_queue.append(review_id)
@@ -321,17 +323,12 @@ class ReviewHandler(BaseHTTPRequestHandler):
         log.info("Review queued: %s  file=%s  session=%s", review_id, file_path, session_id)
 
         # Block until decision or timeout
-        deadline = time.time() + REVIEW_TIMEOUT
-        while True:
-            time.sleep(0.2)
-            with state_lock:
-                decision = pending_reviews.get(review_id, {}).get("decision")
-            if decision is not None:
-                break
-            if time.time() > deadline:
-                decision = "allow"   # timeout → auto-allow
-                log.info("Review %s timed out, auto-allowing", review_id)
-                break
+        _ev.wait(timeout=REVIEW_TIMEOUT)
+        with state_lock:
+            decision = pending_reviews.get(review_id, {}).get("decision")
+        if decision is None:
+            decision = "allow"
+            log.info("Review %s timed out, auto-allowing", review_id)
 
         # Cleanup — and invalidate any queued reviews for the same file
         # from other sessions so they get a clean deny instead of a stale edit error
@@ -348,6 +345,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     if r and r.get("file_path") == file_path and r.get("session_id") != session_id:
                         r["decision"] = "deny"
                         r["reason"] = "file was modified by another agent while queued"
+                        ev = r.get("_event")
+                        if ev:
+                            ev.set()
                         invalidated.append(rid)
 
         if invalidated:
@@ -461,9 +461,13 @@ async def ws_handler(websocket) -> None:
                 review_id = msg.get("review_id")
                 decision = msg.get("decision")
                 log.info("WS decision: review=%s decision=%s", review_id, decision)
+                ev = None
                 with state_lock:
                     if review_id in pending_reviews:
                         pending_reviews[review_id]["decision"] = decision
+                        ev = pending_reviews[review_id].get("_event")
+                if ev is not None:
+                    ev.set()
 
             elif msg_type == "unlock_file":
                 file_path = msg.get("file_path", "")
@@ -519,7 +523,7 @@ def main() -> None:
     wd_t.start()
 
     # HTTP server (blocking, main thread)
-    server = HTTPServer(("localhost", HTTP_PORT), ReviewHandler)
+    server = ThreadingHTTPServer(("localhost", HTTP_PORT), ReviewHandler)
     log.info("HTTP server listening on http://localhost:%d", HTTP_PORT)
     try:
         server.serve_forever()
