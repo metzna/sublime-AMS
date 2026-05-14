@@ -489,7 +489,7 @@ def _start_server_if_needed():
             return  # already running
         except Exception:
             pass
-        script = os.path.expanduser("~/.claude/sublime_review_server.py")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sublime_review_server.py")
         if not os.path.exists(script):
             sublime.status_message("SublimeReview: server script not found: " + script)
             return
