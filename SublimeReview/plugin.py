@@ -442,7 +442,6 @@ class _InlineDiff(object):
             sublime.Phantom(sublime.Region(end_pt), _build_phantom_html(new), sublime.LAYOUT_BLOCK)
         ])
 
-        self._window.focus_view(v)
         v.show(region, True)
         return True
 
