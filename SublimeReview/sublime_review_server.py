@@ -45,7 +45,7 @@ LOG_FILE = "~/.claude/sublime_review_server.log"
 # only intercept Claude when Sublime Text is actually open — including after a
 # Sublime crash, because the WebSocket disconnect triggers _disable_hooks().
 
-_HOOKS_DIR       = os.path.expanduser("~/.claude/hooks")
+_HOOKS_DIR       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks")
 _REVIEW_CMD      = "python3 " + os.path.join(_HOOKS_DIR, "sublime_review.py")
 _SESSION_END_CMD = "python3 " + os.path.join(_HOOKS_DIR, "sublime_session_end.py")
 _SETTINGS_PATH   = os.path.expanduser("~/.claude/settings.json")
