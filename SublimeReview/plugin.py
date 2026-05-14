@@ -307,6 +307,7 @@ class _ReviewPanel(object):
             v.set_read_only(False)
             v.run_command("sublime_review_set_content", {"text": text})
             v.set_read_only(True)
+            v.show(0)
 
             is_write = (tool == "Write")
             if is_write and not compact:
