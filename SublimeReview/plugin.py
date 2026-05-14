@@ -691,6 +691,23 @@ class _Manager(object):
             self._panel.show(review, compact=False)
         self._refresh()
 
+    def show_current(self):
+        """Re-render the active review — call after anything that hides the panel."""
+        with self._mu:
+            review = self._active
+        if review is None:
+            return
+        tool = review.get("tool_name", "")
+        if tool in ("Edit", "MultiEdit"):
+            ok = self._inline.show(review)
+            self._panel.show(review, compact=ok)
+        else:
+            self._panel.show(review, compact=False)
+
+    def has_pending(self):
+        with self._mu:
+            return self._active is not None or bool(self._queue)
+
     def _refresh(self):
         with self._mu:
             w = len(self._queue)
@@ -769,6 +786,17 @@ class SublimeReviewNextCommand(sublime_plugin.WindowCommand):
         m = _manager(self.window)
         if m:
             m.cycle()
+
+
+class SublimeReviewShowCommand(sublime_plugin.WindowCommand):
+    def run(self):
+        m = _manager(self.window)
+        if m:
+            m.show_current()
+
+    def is_enabled(self):
+        m = _managers.get(self.window.id())
+        return m is not None and m.has_pending()
 
 
 class SublimeReviewUnlockFileCommand(sublime_plugin.WindowCommand):

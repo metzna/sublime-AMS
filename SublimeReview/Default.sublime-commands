@@ -1,0 +1,26 @@
+[
+    {
+        "caption": "SublimeReview: Show Pending Review",
+        "command": "sublime_review_show"
+    },
+    {
+        "caption": "SublimeReview: Accept",
+        "command": "sublime_review_accept"
+    },
+    {
+        "caption": "SublimeReview: Reject",
+        "command": "sublime_review_reject"
+    },
+    {
+        "caption": "SublimeReview: Next Review",
+        "command": "sublime_review_next"
+    },
+    {
+        "caption": "SublimeReview: Unlock Current File",
+        "command": "sublime_review_unlock_file"
+    },
+    {
+        "caption": "SublimeReview: Reconnect",
+        "command": "sublime_review_connect"
+    }
+]
