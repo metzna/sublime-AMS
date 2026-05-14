@@ -442,6 +442,7 @@ class _InlineDiff(object):
             sublime.Phantom(sublime.Region(end_pt), _build_phantom_html(new), sublime.LAYOUT_BLOCK)
         ])
 
+        self._window.focus_view(v)
         v.show(region, True)
         return True
 
@@ -688,6 +689,12 @@ class _Manager(object):
             self._panel.show(review, compact=ok)
         else:
             self._panel.show(review, compact=False)
+        # focus_view() (called inside _inline.show) is async — re-show the
+        # panel on the next tick so it always wins the focus race.
+        w = self._window
+        sublime.set_timeout(
+            lambda: w.run_command("show_panel", {"panel": "output." + PANEL_NAME}), 0
+        )
         self._refresh()
 
     def show_current(self):
