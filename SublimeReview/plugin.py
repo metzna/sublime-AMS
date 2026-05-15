@@ -542,11 +542,6 @@ body {
     color: color(var(--foreground) alpha(0.35));
     font-size: 0.82em;
 }
-.children {
-    padding-left: 14px;
-    border-left: 1px solid color(var(--foreground) alpha(0.1));
-    margin-top: 8px;
-}
 </style>"""
 
 
@@ -558,6 +553,7 @@ class _DashboardView(object):
         self._sheet        = None
         self._agents       = {}
         self._saved_layout = None
+        self._timer_gen    = 0
 
     # ── Public ──────────────────────────────────────────────────────────────
 
@@ -596,6 +592,7 @@ class _DashboardView(object):
         s.set("overlay_scroll_bars",   "enabled")
 
     def close(self):
+        self._timer_gen += 1
         sheet, self._sheet = self._sheet, None
         if sheet is not None:
             try:
@@ -606,6 +603,7 @@ class _DashboardView(object):
 
     def on_closed(self):
         """Called when the dashboard sheet is closed externally."""
+        self._timer_gen += 1
         self._sheet = None
         self._restore_layout()
 
@@ -653,7 +651,11 @@ class _DashboardView(object):
             sublime.set_timeout(lambda: self._window.set_layout(layout), 100)
 
     def _start_timer(self):
+        self._timer_gen += 1
+        gen = self._timer_gen
         def _tick():
+            if self._timer_gen != gen:
+                return
             if not self._is_open():
                 if self._saved_layout is not None:
                     self._restore_layout()
@@ -681,12 +683,6 @@ class _DashboardView(object):
             agents.items(),
             key=lambda x: (x[1].get("status") == "finished", -x[1].get("last_seen", 0)),
         )
-        child_map = {}
-        for sid, a in items:
-            p = a.get("parent_session_id")
-            if p:
-                child_map.setdefault(p, []).append((sid, a))
-        roots = [(sid, a) for sid, a in items if not a.get("parent_session_id")]
 
         def _short_cwd(path):
             parts = path.replace("\\", "/").rstrip("/").split("/")
@@ -733,17 +729,11 @@ class _DashboardView(object):
                 lock_str = ("&nbsp;&nbsp;{}&nbsp;lock{}".format(nlocks, "s" if nlocks != 1 else "")
                             if nlocks else "")
                 h += '<span class="meta">{}{}</span>'.format(esc(_short_cwd(cwd)), lock_str)
-            children = child_map.get(sid, [])
-            if children:
-                h += '<div class="children">'
-                for csid, ca in children:
-                    h += block(csid, ca)
-                h += '</div>'
             h += '</div>'
             return h
 
         body = _DASHBOARD_CSS + "<body>"
-        for sid, a in roots:
+        for sid, a in items:
             body += block(sid, a)
         body += "</body>"
         return body
@@ -889,6 +879,7 @@ class _Manager(object):
         self._inline.clear()
         self._panel.clear()
         self._cancelled_ids.clear()
+        self._dashboard.close()
 
     def _connect(self):
         url = "ws://{0}:{1}".format(_host(), _port())
