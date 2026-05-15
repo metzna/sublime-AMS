@@ -11,8 +11,7 @@
 #   Commands       — SublimeReviewAccept/Reject/Next/UnlockFile/Connect
 #   Listeners      — SublimeReviewListener (lifecycle), SublimeReviewPanelContext (keybindings)
 #
-# Python 3.3 compatible: no type annotations, no f-strings, no typing module.
-# (Sublime Text 4 defaults to Python 3.3 for packages without .python-version.)
+# Requires Python 3.8+ (.python-version pins Sublime's host to 3.8).
 
 import base64
 import difflib
@@ -694,9 +693,30 @@ class _Manager(object):
         if tool in ("Edit", "MultiEdit"):
             ok = self._inline.show(review)
             self._panel.show(review, compact=ok)
+            if not ok:
+                fp = review.get("file_path", "")
+                loading = self._window.find_open_file(fp)
+                if loading is not None and loading.is_loading():
+                    self._wait_for_inline(loading, review, 0)
         else:
             self._panel.show(review, compact=False)
         self._refresh()
+
+    def _wait_for_inline(self, v, review, attempts):
+        if attempts >= 50:  # give up after 5 s
+            return
+        if v.is_loading():
+            sublime.set_timeout(
+                lambda: self._wait_for_inline(v, review, attempts + 1), 100
+            )
+            return
+        with self._mu:
+            still_active = (
+                self._active is not None and
+                self._active.get("review_id") == review.get("review_id")
+            )
+        if still_active and self._inline.show(review):
+            self._panel.show(review, compact=True)
 
     def show_current(self):
         """Re-render the active review — call after anything that hides the panel."""
