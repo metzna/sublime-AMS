@@ -502,7 +502,7 @@ class _DashboardView(object):
         self._window.set_layout(_LAYOUT_TWO_COL)
         self._window.focus_group(1)
         v = self._window.new_file()
-        v.set_name(" Agents ")
+        v.set_name("Agents")
         v.set_scratch(True)
         v.settings().set("sublime_agents_dashboard", True)
         v.settings().set("gutter",          False)
