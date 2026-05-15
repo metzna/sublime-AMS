@@ -504,7 +504,6 @@ class _DashboardView(object):
         v = self._window.new_file()
         v.set_name(" Agents ")
         v.set_scratch(True)
-        v.set_read_only(True)
         v.settings().set("sublime_agents_dashboard", True)
         v.settings().set("gutter",          False)
         v.settings().set("line_numbers",    False)
@@ -606,9 +605,7 @@ class _DashboardView(object):
                 _add(sid, a, 0)
 
         text = "".join(lines)
-        v.set_read_only(False)
         v.run_command("sublime_review_set_content", {"text": text})
-        v.set_read_only(True)
 
         # Erase previous agent regions
         for i in range(self._prev_count + 5):
