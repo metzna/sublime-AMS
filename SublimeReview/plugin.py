@@ -344,6 +344,11 @@ class _ReviewPanel(object):
                 if not compact:
                     # Defer coloring so the view is fully rendered before add_regions runs
                     sublime.set_timeout(lambda: self._colorize(v), 30)
+
+            # Give the panel keyboard focus so Enter/Escape/Tab keybindings work.
+            # Focusing an output panel does not change the active file tab, so
+            # the inline diff in the editor remains visible.
+            self._window.focus_view(v)
         except Exception as e:
             sublime.status_message("SublimeReview panel error: " + str(e))
 
