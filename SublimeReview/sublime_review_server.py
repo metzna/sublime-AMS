@@ -45,11 +45,13 @@ LOG_FILE = "~/.claude/sublime_review_server.log"
 # only intercept Claude when Sublime Text is actually open — including after a
 # Sublime crash, because the WebSocket disconnect triggers _disable_hooks().
 
-_HOOKS_DIR       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks")
-_REVIEW_CMD      = "python3 " + os.path.join(_HOOKS_DIR, "sublime_review.py")
-_ACTIVITY_CMD    = "python3 " + os.path.join(_HOOKS_DIR, "activity.py")
-_SESSION_END_CMD = "python3 " + os.path.join(_HOOKS_DIR, "sublime_session_end.py")
-_SETTINGS_PATH   = os.path.expanduser("~/.claude/settings.json")
+_HOOKS_DIR            = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks")
+_REVIEW_CMD           = "python3 " + os.path.join(_HOOKS_DIR, "sublime_review.py")
+_ACTIVITY_CMD         = "python3 " + os.path.join(_HOOKS_DIR, "activity.py")
+_SESSION_END_CMD      = "python3 " + os.path.join(_HOOKS_DIR, "sublime_session_end.py")
+_SUBAGENT_START_CMD   = "python3 " + os.path.join(_HOOKS_DIR, "subagent_start.py")
+_SUBAGENT_STOP_CMD    = "python3 " + os.path.join(_HOOKS_DIR, "subagent_stop.py")
+_SETTINGS_PATH        = os.path.expanduser("~/.claude/settings.json")
 
 
 def _first_hook_command(entry):
@@ -92,6 +94,12 @@ def _enable_hooks():
     end = hooks.setdefault("SessionEnd", [])
     if not any(_first_hook_command(e) == _SESSION_END_CMD for e in end):
         end.append({"hooks": [{"type": "command", "command": _SESSION_END_CMD}]})
+    sub_start = hooks.setdefault("SubagentStart", [])
+    if not any(_first_hook_command(e) == _SUBAGENT_START_CMD for e in sub_start):
+        sub_start.append({"hooks": [{"type": "command", "command": _SUBAGENT_START_CMD, "timeout": 10}]})
+    sub_stop = hooks.setdefault("SubagentStop", [])
+    if not any(_first_hook_command(e) == _SUBAGENT_STOP_CMD for e in sub_stop):
+        sub_stop.append({"hooks": [{"type": "command", "command": _SUBAGENT_STOP_CMD, "timeout": 10}]})
     _atomic_write_json(_SETTINGS_PATH, data)
     log.info("Hooks enabled")
 
@@ -110,7 +118,13 @@ def _disable_hooks():
     hooks["SessionEnd"] = [
         e for e in hooks.get("SessionEnd", []) if _first_hook_command(e) != _SESSION_END_CMD
     ]
-    for key in ("PreToolUse", "SessionEnd"):
+    hooks["SubagentStart"] = [
+        e for e in hooks.get("SubagentStart", []) if _first_hook_command(e) != _SUBAGENT_START_CMD
+    ]
+    hooks["SubagentStop"] = [
+        e for e in hooks.get("SubagentStop", []) if _first_hook_command(e) != _SUBAGENT_STOP_CMD
+    ]
+    for key in ("PreToolUse", "SessionEnd", "SubagentStart", "SubagentStop"):
         if not hooks.get(key):
             hooks.pop(key, None)
     if not hooks:
@@ -283,6 +297,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self._handle_review()
         elif self.path == "/activity":
             self._handle_activity()
+        elif self.path == "/subagent/start":
+            self._handle_subagent_start()
+        elif self.path == "/subagent/stop":
+            self._handle_subagent_stop()
         elif self.path == "/unlock_session":
             self._handle_unlock_session()
         elif self.path == "/unlock_file":
@@ -449,6 +467,61 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 "parent_session_id": existing.get("parent_session_id"),
                 "children":          existing.get("children", []),
             }
+        push_agent_update()
+        self.send_json(200, {"ok": True})
+
+    # ── /subagent/start ───────────────────────────────────────────────────────
+
+    def _handle_subagent_start(self):
+        try:
+            body = self.read_body()
+        except Exception as e:
+            self.send_json(400, {"error": str(e)})
+            return
+        parent_sid = body.get("parent_session_id", "unknown")
+        agent_id   = body.get("agent_id", "")
+        agent_type = body.get("agent_type", "subagent")
+        cwd        = body.get("cwd", "")
+        if not agent_id:
+            self.send_json(400, {"error": "agent_id required"})
+            return
+        with state_lock:
+            parent = agents.get(parent_sid, {})
+            agents[agent_id] = {
+                "type":              agent_type,
+                "status":            "active",
+                "cwd":               cwd or parent.get("cwd", ""),
+                "last_action":       "started",
+                "last_seen":         time.time(),
+                "parent_session_id": parent_sid,
+                "children":          [],
+            }
+            if parent_sid in agents:
+                children = agents[parent_sid].setdefault("children", [])
+                if agent_id not in children:
+                    children.append(agent_id)
+        log.info("Subagent started: %s (parent: %s)", agent_id, parent_sid)
+        push_agent_update()
+        self.send_json(200, {"ok": True})
+
+    # ── /subagent/stop ────────────────────────────────────────────────────────
+
+    def _handle_subagent_stop(self):
+        try:
+            body = self.read_body()
+        except Exception as e:
+            self.send_json(400, {"error": str(e)})
+            return
+        agent_id = body.get("agent_id", "")
+        if not agent_id:
+            self.send_json(400, {"error": "agent_id required"})
+            return
+        with state_lock:
+            if agent_id in agents:
+                agents[agent_id]["status"]      = "finished"
+                agents[agent_id]["last_seen"]   = time.time()
+                agents[agent_id]["last_action"] = "finished"
+        log.info("Subagent finished: %s", agent_id)
         push_agent_update()
         self.send_json(200, {"ok": True})
 
