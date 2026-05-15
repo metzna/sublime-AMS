@@ -47,6 +47,7 @@ LOG_FILE = "~/.claude/sublime_review_server.log"
 
 _HOOKS_DIR       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks")
 _REVIEW_CMD      = "python3 " + os.path.join(_HOOKS_DIR, "sublime_review.py")
+_ACTIVITY_CMD    = "python3 " + os.path.join(_HOOKS_DIR, "activity.py")
 _SESSION_END_CMD = "python3 " + os.path.join(_HOOKS_DIR, "sublime_session_end.py")
 _SETTINGS_PATH   = os.path.expanduser("~/.claude/settings.json")
 
@@ -79,6 +80,10 @@ def _enable_hooks():
         data = {}
     hooks = data.setdefault("hooks", {})
     pre = hooks.setdefault("PreToolUse", [])
+    if not any(_first_hook_command(e) == _ACTIVITY_CMD for e in pre):
+        pre.append({
+            "hooks": [{"type": "command", "command": _ACTIVITY_CMD, "timeout": 10}],
+        })
     if not any(_first_hook_command(e) == _REVIEW_CMD for e in pre):
         pre.append({
             "matcher": "Edit|Write|MultiEdit",
@@ -99,7 +104,8 @@ def _disable_hooks():
         return
     hooks = data.get("hooks", {})
     hooks["PreToolUse"] = [
-        e for e in hooks.get("PreToolUse", []) if _first_hook_command(e) != _REVIEW_CMD
+        e for e in hooks.get("PreToolUse", [])
+        if _first_hook_command(e) not in (_REVIEW_CMD, _ACTIVITY_CMD)
     ]
     hooks["SessionEnd"] = [
         e for e in hooks.get("SessionEnd", []) if _first_hook_command(e) != _SESSION_END_CMD
@@ -275,6 +281,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/review":
             self._handle_review()
+        elif self.path == "/activity":
+            self._handle_activity()
         elif self.path == "/unlock_session":
             self._handle_unlock_session()
         elif self.path == "/unlock_file":
@@ -418,6 +426,31 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
         log.info("Review %s decision=%s", review_id, decision)
         self.send_json(200, {"decision": decision, "reason": reason})
+
+    # ── /activity ─────────────────────────────────────────────────────────────
+
+    def _handle_activity(self):
+        try:
+            body = self.read_body()
+        except Exception as e:
+            self.send_json(400, {"error": str(e)})
+            return
+        session_id = body.get("session_id", "unknown")
+        action     = body.get("action", "")
+        cwd        = body.get("cwd", "")
+        with state_lock:
+            existing = agents.get(session_id, {})
+            agents[session_id] = {
+                "type":              existing.get("type", "claude_code"),
+                "status":            "active",
+                "cwd":               cwd or existing.get("cwd", ""),
+                "last_action":       action,
+                "last_seen":         time.time(),
+                "parent_session_id": existing.get("parent_session_id"),
+                "children":          existing.get("children", []),
+            }
+        push_agent_update()
+        self.send_json(200, {"ok": True})
 
     # ── /unlock_session ───────────────────────────────────────────────────────
 
