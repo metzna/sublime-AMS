@@ -38,6 +38,7 @@ WS_PORT = 9877         # Sublime plugin connects via WebSocket here
 LOCK_TIMEOUT = 600     # seconds before an unresolved lock is force-released
 REVIEW_TIMEOUT = 300   # seconds before a pending review is auto-allowed
 LOG_FILE = "~/.claude/sublime_review_server.log"
+AUDIT_LOG_PATH = os.path.expanduser("~/.local/share/sublime-agents/audit.jsonl")
 
 # ─── Hook management ─────────────────────────────────────────────────────────
 # Hooks are written into ~/.claude/settings.json when the first Sublime client
@@ -48,6 +49,7 @@ LOG_FILE = "~/.claude/sublime_review_server.log"
 _HOOKS_DIR            = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks")
 _REVIEW_CMD           = "python3 " + os.path.join(_HOOKS_DIR, "sublime_review.py")
 _ACTIVITY_CMD         = "python3 " + os.path.join(_HOOKS_DIR, "activity.py")
+_POST_TOOL_CMD        = "python3 " + os.path.join(_HOOKS_DIR, "post_tool_use.py")
 _SESSION_END_CMD      = "python3 " + os.path.join(_HOOKS_DIR, "sublime_session_end.py")
 _SUBAGENT_START_CMD   = "python3 " + os.path.join(_HOOKS_DIR, "subagent_start.py")
 _SUBAGENT_STOP_CMD    = "python3 " + os.path.join(_HOOKS_DIR, "subagent_stop.py")
@@ -57,6 +59,29 @@ _SETTINGS_PATH        = os.path.expanduser("~/.claude/settings.json")
 def _first_hook_command(entry):
     hooks = entry.get("hooks", [])
     return hooks[0].get("command", "") if hooks else ""
+
+
+# Script filenames that belong to this plugin.  Matched by basename so that
+# stale entries from a different installation path are also recognised.
+_OUR_HOOK_BASENAMES = frozenset({
+    "sublime_review.py",
+    "activity.py",
+    "post_tool_use.py",
+    "sublime_session_end.py",
+    "subagent_start.py",
+    "subagent_stop.py",
+})
+
+
+def _hook_basename(entry) -> str:
+    """Return the script filename from a hook entry (e.g. 'sublime_review.py')."""
+    cmd = _first_hook_command(entry)
+    parts = cmd.split() if cmd else []
+    return os.path.basename(parts[-1]) if parts else ""
+
+
+def _is_our_hook(entry) -> bool:
+    return _hook_basename(entry) in _OUR_HOOK_BASENAMES
 
 
 def _atomic_write_json(path, data):
@@ -81,27 +106,33 @@ def _enable_hooks():
     except Exception:
         data = {}
     hooks = data.setdefault("hooks", {})
-    pre = hooks.setdefault("PreToolUse", [])
-    if not any(_first_hook_command(e) == _ACTIVITY_CMD for e in pre):
-        pre.append({
-            "hooks": [{"type": "command", "command": _ACTIVITY_CMD, "timeout": 10}],
-        })
-    if not any(_first_hook_command(e) == _REVIEW_CMD for e in pre):
-        pre.append({
-            "matcher": "Edit|Write|MultiEdit",
-            "hooks": [{"type": "command", "command": _REVIEW_CMD, "timeout": 300}],
-        })
-    end = hooks.setdefault("SessionEnd", [])
-    if not any(_first_hook_command(e) == _SESSION_END_CMD for e in end):
-        end.append({"hooks": [{"type": "command", "command": _SESSION_END_CMD}]})
-    sub_start = hooks.setdefault("SubagentStart", [])
-    if not any(_first_hook_command(e) == _SUBAGENT_START_CMD for e in sub_start):
-        sub_start.append({"hooks": [{"type": "command", "command": _SUBAGENT_START_CMD, "timeout": 10}]})
-    sub_stop = hooks.setdefault("SubagentStop", [])
-    if not any(_first_hook_command(e) == _SUBAGENT_STOP_CMD for e in sub_stop):
-        sub_stop.append({"hooks": [{"type": "command", "command": _SUBAGENT_STOP_CMD, "timeout": 10}]})
+    # Remove any stale entries from other installation paths before adding ours
+    _purge_our_hooks(hooks)
+    hooks.setdefault("PreToolUse", []).extend([
+        {"hooks": [{"type": "command", "command": _ACTIVITY_CMD, "timeout": 10}]},
+        {"matcher": "Edit|Write|MultiEdit",
+         "hooks": [{"type": "command", "command": _REVIEW_CMD, "timeout": 300}]},
+    ])
+    hooks.setdefault("PostToolUse", []).append(
+        {"hooks": [{"type": "command", "command": _POST_TOOL_CMD, "timeout": 10}]}
+    )
+    hooks.setdefault("SessionEnd", []).append(
+        {"hooks": [{"type": "command", "command": _SESSION_END_CMD}]}
+    )
+    hooks.setdefault("SubagentStart", []).append(
+        {"hooks": [{"type": "command", "command": _SUBAGENT_START_CMD, "timeout": 10}]}
+    )
+    hooks.setdefault("SubagentStop", []).append(
+        {"hooks": [{"type": "command", "command": _SUBAGENT_STOP_CMD, "timeout": 10}]}
+    )
     _atomic_write_json(_SETTINGS_PATH, data)
     log.info("Hooks enabled")
+
+
+def _purge_our_hooks(hooks: dict) -> None:
+    """Remove all entries that belong to this plugin (matched by script basename)."""
+    for key in ("PreToolUse", "PostToolUse", "SessionEnd", "SubagentStart", "SubagentStop"):
+        hooks[key] = [e for e in hooks.get(key, []) if not _is_our_hook(e)]
 
 
 def _disable_hooks():
@@ -111,20 +142,8 @@ def _disable_hooks():
     except Exception:
         return
     hooks = data.get("hooks", {})
-    hooks["PreToolUse"] = [
-        e for e in hooks.get("PreToolUse", [])
-        if _first_hook_command(e) not in (_REVIEW_CMD, _ACTIVITY_CMD)
-    ]
-    hooks["SessionEnd"] = [
-        e for e in hooks.get("SessionEnd", []) if _first_hook_command(e) != _SESSION_END_CMD
-    ]
-    hooks["SubagentStart"] = [
-        e for e in hooks.get("SubagentStart", []) if _first_hook_command(e) != _SUBAGENT_START_CMD
-    ]
-    hooks["SubagentStop"] = [
-        e for e in hooks.get("SubagentStop", []) if _first_hook_command(e) != _SUBAGENT_STOP_CMD
-    ]
-    for key in ("PreToolUse", "SessionEnd", "SubagentStart", "SubagentStop"):
+    _purge_our_hooks(hooks)
+    for key in ("PreToolUse", "PostToolUse", "SessionEnd", "SubagentStart", "SubagentStop"):
         if not hooks.get(key):
             hooks.pop(key, None)
     if not hooks:
@@ -163,6 +182,9 @@ ws_clients: set = set()
 # asyncio event loop (set when WS server starts)
 ws_loop: Optional[asyncio.AbstractEventLoop] = None
 
+# Audit log write lock (separate from state_lock to avoid contention)
+_audit_lock = Lock()
+
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -173,6 +195,20 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("sublime_review_server")
+
+
+# ─── Audit log ───────────────────────────────────────────────────────────────
+
+def _audit(event_type: str, **kwargs) -> None:
+    """Append one event line to the append-only audit JSONL (best-effort)."""
+    try:
+        os.makedirs(os.path.dirname(AUDIT_LOG_PATH), exist_ok=True)
+        record = json.dumps({"ts": time.time(), "event": event_type, **kwargs})
+        with _audit_lock:
+            with open(AUDIT_LOG_PATH, "a") as f:
+                f.write(record + "\n")
+    except Exception:
+        pass
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -383,6 +419,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
         push_lock_update()
         push_agent_update()
+        _audit("review_queued", session_id=session_id, review_id=review_id,
+               tool_name=tool_name, file_path=file_path)
 
         # Notify Sublime
         ws_message = {
@@ -442,6 +480,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
         push_lock_update()
         _broadcast_queue_positions()
 
+        _audit("review_decision", session_id=session_id, review_id=review_id,
+               decision=decision, reason=reason)
         log.info("Review %s decision=%s", review_id, decision)
         self.send_json(200, {"decision": decision, "reason": reason})
 
@@ -453,21 +493,39 @@ class ReviewHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json(400, {"error": str(e)})
             return
-        session_id = body.get("session_id", "unknown")
-        action     = body.get("action", "")
-        cwd        = body.get("cwd", "")
-        with state_lock:
-            existing = agents.get(session_id, {})
-            agents[session_id] = {
-                "type":              existing.get("type", "claude_code"),
-                "status":            "active",
-                "cwd":               cwd or existing.get("cwd", ""),
-                "last_action":       action,
-                "last_seen":         time.time(),
-                "parent_session_id": existing.get("parent_session_id"),
-                "children":          existing.get("children", []),
-            }
-        push_agent_update()
+        session_id  = body.get("session_id", "unknown")
+        event_type  = body.get("event_type", "pre_tool_use")
+        cwd         = body.get("cwd", "")
+
+        if event_type == "post_tool_use":
+            # PostToolUse: write audit log only, don't update dashboard action
+            tool_name      = body.get("tool_name", "")
+            result_summary = body.get("result_summary")
+            result_snippet = body.get("result_snippet", "")
+            _audit("post_tool_use", session_id=session_id,
+                   tool_name=tool_name, result_summary=result_summary,
+                   result_snippet=result_snippet)
+            # Update last_seen so the agent doesn't appear stale
+            with state_lock:
+                if session_id in agents:
+                    agents[session_id]["last_seen"] = time.time()
+        else:
+            # PreToolUse: update dashboard action + write audit
+            action = body.get("action", "")
+            with state_lock:
+                existing = agents.get(session_id, {})
+                agents[session_id] = {
+                    "type":              existing.get("type", "claude_code"),
+                    "status":            "active",
+                    "cwd":               cwd or existing.get("cwd", ""),
+                    "last_action":       action,
+                    "last_seen":         time.time(),
+                    "parent_session_id": existing.get("parent_session_id"),
+                    "children":          existing.get("children", []),
+                }
+            _audit("activity", session_id=session_id, action=action)
+            push_agent_update()
+
         self.send_json(200, {"ok": True})
 
     # ── /subagent/start ───────────────────────────────────────────────────────
@@ -501,6 +559,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 if agent_id not in children:
                     children.append(agent_id)
         log.info("Subagent started: %s (parent: %s)", agent_id, parent_sid)
+        _audit("subagent_started", agent_id=agent_id, parent_session_id=parent_sid,
+               agent_type=agent_type)
         push_agent_update()
         self.send_json(200, {"ok": True})
 
@@ -522,6 +582,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 agents[agent_id]["last_seen"]   = time.time()
                 agents[agent_id]["last_action"] = "finished"
         log.info("Subagent finished: %s", agent_id)
+        _audit("subagent_finished", agent_id=agent_id)
         push_agent_update()
         self.send_json(200, {"ok": True})
 
@@ -540,6 +601,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 agents[session_id]["status"] = "finished"
                 agents[session_id]["last_seen"] = time.time()
                 agents[session_id]["last_action"] = "session ended"
+        _audit("session_ended", session_id=session_id, released_locks=released)
         push_agent_update()
         self.send_json(200, {"released": released})
 

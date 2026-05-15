@@ -345,10 +345,10 @@ class _ReviewPanel(object):
                     # Defer coloring so the view is fully rendered before add_regions runs
                     sublime.set_timeout(lambda: self._colorize(v), 30)
 
-            # Give the panel keyboard focus so Enter/Escape/Tab keybindings work.
-            # Focusing an output panel does not change the active file tab, so
-            # the inline diff in the editor remains visible.
-            self._window.focus_view(v)
+            # Re-run show_panel last to guarantee keyboard focus lands on the
+            # panel. focus_view() is unreliable for output panels on Linux;
+            # show_panel is the authoritative way to give an output panel focus.
+            self._window.run_command("show_panel", {"panel": "output." + PANEL_NAME})
         except Exception as e:
             sublime.status_message("SublimeReview panel error: " + str(e))
 
@@ -447,8 +447,10 @@ class _InlineDiff(object):
             sublime.Phantom(sublime.Region(end_pt), _build_phantom_html(new), sublime.LAYOUT_BLOCK)
         ])
 
-        self._window.focus_view(v)
-        v.show(region, True)
+        # Scroll to the diff region without focusing — focus_view would steal
+        # keyboard focus from the review panel that _panel.show() will give focus.
+        # animate=False avoids a deferred re-focus side-effect on Linux.
+        v.show(region, False)
         return True
 
     def clear(self):
@@ -1049,7 +1051,11 @@ class SublimeReviewPanelContext(sublime_plugin.EventListener):
     def on_query_context(self, view, key, operator, operand, match_all):
         if key != "sublime_review_panel_focused":
             return None
-        val = bool(view.settings().get("sublime_review_panel", False))
+        # Output panels don't update window.active_view(), so checking the view's
+        # settings is unreliable — the view passed here is the last active editor.
+        # Use active_panel() instead, which correctly reflects panel focus.
+        w = view.window()
+        val = w is not None and w.active_panel() == "output." + PANEL_NAME
         if operator == sublime.OP_EQUAL:
             return val == operand
         if operator == sublime.OP_NOT_EQUAL:
