@@ -703,7 +703,7 @@ class _Manager(object):
         self._refresh()
 
     def _wait_for_inline(self, v, review, attempts):
-        if attempts >= 50:  # give up after 5 s
+        if attempts >= 30:  # give up after 3 s
             return
         if v.is_loading():
             sublime.set_timeout(
