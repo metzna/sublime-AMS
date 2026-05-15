@@ -615,9 +615,24 @@ class _DashboardView(object):
         sublime.set_timeout(self._refresh, 0)
 
     def _refresh(self):
+        if not self._is_open():
+            # After a package reload _sheet is None but the HTML sheet may still
+            # be visible — scan the window and reattach if found.
+            self._reattach()
         if self._is_open():
             try:
                 self._sheet.set_contents(self._build_html())
+            except Exception:
+                pass
+
+    def _reattach(self):
+        for sheet in self._window.sheets():
+            try:
+                v = sheet.view()
+                if v and v.settings().get("sublime_agents_dashboard"):
+                    self._sheet = sheet
+                    self._start_timer()
+                    return
             except Exception:
                 pass
 
@@ -778,9 +793,23 @@ class _LockIndicator(object):
 _managers = {}
 _server_proc = None
 _server_start_lock = threading.Lock()
+_DISABLED = False   # set to True when running as root
+
+
+def _is_root():
+    try:
+        return os.getuid() == 0
+    except AttributeError:
+        try:
+            import ctypes
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except Exception:
+            return False
 
 
 def _manager(window=None):
+    if _DISABLED:
+        return None
     if window is None:
         window = sublime.active_window()
     if window is None:
@@ -1185,6 +1214,13 @@ class SublimeAgentsDashboardListener(sublime_plugin.EventListener):
                 m._dashboard.on_closed()
 
 def plugin_loaded():
+    global _DISABLED
+    if _is_root():
+        _DISABLED = True
+        sublime.status_message(
+            "SublimeReview: disabled — do not run as root/admin"
+        )
+        return
     _start_server_if_needed()
 
 
@@ -1193,7 +1229,8 @@ def plugin_loaded():
 # The server removes hook entries from ~/.claude/settings.json when it
 # detects the last client has disconnected.
 def plugin_unloaded():
-    global _server_proc
+    global _server_proc, _DISABLED
+    _DISABLED = False
     for m in list(_managers.values()):
         m.stop()
     _managers.clear()
