@@ -266,8 +266,6 @@ def _agent_snapshot() -> dict:
             "cwd":               a.get("cwd", ""),
             "last_action":       a.get("last_action", ""),
             "last_seen":         a.get("last_seen", 0.0),
-            "parent_session_id": a.get("parent_session_id"),
-            "children":          a.get("children", []),
             "lock_count":        lock_counts.get(sid, 0),
             "awaiting_review":   reviewing.get(sid),
             "running_subagents": len(a.get("running_subagents", [])),
@@ -402,14 +400,15 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 last_action = "writing " + bn
             else:
                 last_action = tool_name
+            existing = agents.get(session_id, {})
             agents[session_id] = {
                 "type":              body.get("agent_type", "claude_code"),
                 "status":            "active",
-                "cwd":               body.get("cwd", ""),
+                "cwd":               body.get("cwd", "") or existing.get("cwd", ""),
                 "last_action":       last_action,
                 "last_seen":         time.time(),
-                "parent_session_id": body.get("parent_session_id"),
-                "children":          agents.get(session_id, {}).get("children", []),
+                "parent_session_id": existing.get("parent_session_id"),
+                "running_subagents": existing.get("running_subagents", []),
             }
 
             review_id = str(uuid.uuid4())
@@ -531,7 +530,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     "last_action":       action,
                     "last_seen":         time.time(),
                     "parent_session_id": existing.get("parent_session_id"),
-                    "children":          existing.get("children", []),
+                    "running_subagents": existing.get("running_subagents", []),
                 }
             _audit("activity", session_id=session_id, action=action)
             push_agent_update()

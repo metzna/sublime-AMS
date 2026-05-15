@@ -607,6 +607,10 @@ class _DashboardView(object):
         self._sheet = None
         self._restore_layout()
 
+    def stop_timer(self):
+        """Kill the running timer without closing the sheet (use on plugin reload / reconnect)."""
+        self._timer_gen += 1
+
     def update(self, agents):
         self._agents = agents
         # set_contents must be called on the main thread
@@ -879,7 +883,7 @@ class _Manager(object):
         self._inline.clear()
         self._panel.clear()
         self._cancelled_ids.clear()
-        self._dashboard.close()
+        self._dashboard.stop_timer()
 
     def _connect(self):
         url = "ws://{0}:{1}".format(_host(), _port())
@@ -1175,6 +1179,7 @@ class SublimeReviewListener(sublime_plugin.EventListener):
     def on_pre_close_window(self, window):
         m = _managers.pop(window.id(), None)
         if m:
+            m._dashboard.close()
             m.stop()
 
 
