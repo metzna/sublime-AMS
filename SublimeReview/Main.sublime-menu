@@ -1,0 +1,11 @@
+[
+    {
+        "id": "view",
+        "children": [
+            {
+                "caption": "Agent Dashboard",
+                "command": "sublime_agents_dashboard"
+            }
+        ]
+    }
+]
