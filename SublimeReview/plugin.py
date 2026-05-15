@@ -280,8 +280,9 @@ class SublimeReviewSetContentCommand(sublime_plugin.TextCommand):
 
 class _ReviewPanel(object):
     def __init__(self, window):
-        self._window = window
-        self._view   = None
+        self._window   = window
+        self._view     = None
+        self._sep_set  = None
 
     def _get_view(self):
         v = self._window.create_output_panel(PANEL_NAME)
@@ -311,15 +312,13 @@ class _ReviewPanel(object):
             pos     = review.get("queue_position", 1)
             total   = review.get("queue_total", 1)
             color   = _agent_color(review.get("session_id", ""))
-            sep     = "-" * 60
-
             header = (
-                "{sep}\n"
+                "\n"
                 "  {agent}  |  {tool}  |  {pos}/{total} in queue\n"
                 "  {fp}\n"
                 "  [Enter] Accept   [Escape] Reject   [Tab] Next\n"
-                "{sep}\n"
-            ).format(sep=sep, agent=agent, tool=tool, pos=pos, total=total, fp=fp)
+                "\n"
+            ).format(agent=agent, tool=tool, pos=pos, total=total, fp=fp)
 
             text = header if compact else header + _build_diff(review) + "\n"
 
@@ -335,6 +334,20 @@ class _ReviewPanel(object):
                 v.add_regions("sr_agent", [agent_region], "", "",
                               sublime.DRAW_NO_FILL | sublime.DRAW_NO_OUTLINE,
                               annotations=[agent], annotation_color=color)
+
+            sep_html = (
+                '<body id="sr_sep">'
+                '<span style="color:{color};font-family:monospace;">{line}</span>'
+                '</body>'
+            ).format(color=color, line="-" * 60)
+            self._sep_set = sublime.PhantomSet(v, "sr_sep")
+            # Separators are the empty lines at positions 0 and 4 in the header
+            all_lines = v.lines(sublime.Region(0, v.size()))
+            sep_phantoms = [
+                sublime.Phantom(sublime.Region(all_lines[i].begin()), sep_html, sublime.LAYOUT_INLINE)
+                for i in (0, 4) if i < len(all_lines)
+            ]
+            sublime.set_timeout(lambda: self._sep_set.update(sep_phantoms) if self._sep_set else None, 30)
 
             is_write = (tool == "Write")
             if is_write and not compact:
@@ -387,6 +400,9 @@ class _ReviewPanel(object):
 
     def clear(self):
         try:
+            if self._sep_set is not None:
+                self._sep_set.update([])
+                self._sep_set = None
             if self._view and self._view.is_valid():
                 self._view.set_read_only(False)
                 self._view.run_command("select_all")
@@ -447,10 +463,11 @@ class _InlineDiff(object):
             sublime.Phantom(sublime.Region(end_pt), _build_phantom_html(new), sublime.LAYOUT_BLOCK)
         ])
 
-        # Scroll to the diff region without focusing — focus_view would steal
-        # keyboard focus from the review panel that _panel.show() will give focus.
-        # animate=False avoids a deferred re-focus side-effect on Linux.
-        v.show(region, False)
+        # Bring the file tab to the foreground so the inline diff is visible,
+        # then scroll to the region. focus_view is async on Linux, so _next()
+        # schedules a deferred show_panel to ensure the panel wins focus back.
+        self._window.focus_view(v)
+        v.show(region, True)
         return True
 
     def clear(self):
@@ -463,7 +480,7 @@ class _InlineDiff(object):
 
 
 # ===============================================================================
-# Agent dashboard (persistent right-column view)
+# Agent dashboard (HTML sheet in a right column)
 # ===============================================================================
 
 _LAYOUT_TWO_COL = {
@@ -472,16 +489,75 @@ _LAYOUT_TWO_COL = {
     "cells": [[0, 0, 1, 1], [1, 0, 2, 1]],
 }
 
+_DASHBOARD_CSS = """<style>
+html, body { margin: 0; padding: 0; }
+body {
+    padding: 10px 8px;
+    background-color: var(--background);
+    color: var(--foreground);
+}
+.empty {
+    color: color(var(--foreground) alpha(0.4));
+    font-style: italic;
+}
+.agent { margin-bottom: 14px; }
+.hdr { display: block; }
+.dot { margin-right: 4px; font-weight: bold; }
+.name { font-weight: bold; }
+.sid {
+    color: color(var(--foreground) alpha(0.4));
+    font-size: 0.85em;
+    margin-left: 4px;
+}
+.st { font-size: 0.85em; margin-left: 6px; }
+.st-active   { color: var(--greenish,  #8fbc8f); }
+.st-paused   { color: var(--yellowish, #d4a84b); }
+.st-finished { color: color(var(--foreground) alpha(0.35)); }
+.st-review   { color: var(--yellowish, #d4a84b); }
+.reviewing {
+    display: block;
+    padding-left: 14px;
+    margin-top: 3px;
+    color: var(--yellowish, #d4a84b);
+    font-size: 0.9em;
+}
+.subagent {
+    display: block;
+    padding-left: 14px;
+    margin-top: 2px;
+    color: color(var(--foreground) alpha(0.5));
+    font-size: 0.82em;
+}
+.action {
+    display: block;
+    padding-left: 14px;
+    margin-top: 3px;
+    color: color(var(--foreground) alpha(0.6));
+    font-size: 0.9em;
+}
+.meta {
+    display: block;
+    padding-left: 14px;
+    margin-top: 1px;
+    color: color(var(--foreground) alpha(0.35));
+    font-size: 0.82em;
+}
+.children {
+    padding-left: 14px;
+    border-left: 1px solid color(var(--foreground) alpha(0.1));
+    margin-top: 8px;
+}
+</style>"""
+
 
 class _DashboardView(object):
-    """Manages the agent tree view in a dedicated right column."""
+    """Manages the agent dashboard as an HTML sheet in a right column."""
 
     def __init__(self, window):
         self._window       = window
-        self._view         = None
+        self._sheet        = None
         self._agents       = {}
         self._saved_layout = None
-        self._prev_count   = 0   # how many sa_agent_N regions were written last render
 
     # ── Public ──────────────────────────────────────────────────────────────
 
@@ -492,143 +568,181 @@ class _DashboardView(object):
             self.open()
 
     def open(self):
-        # Reuse view if it survived a plugin reload
-        for v in self._window.views():
-            if v.settings().get("sublime_agents_dashboard"):
-                self._view = v
-                self._window.focus_view(v)
-                self._start_timer()
-                return
-
+        if self._is_open():
+            self._window.focus_group(0)
+            return
         self._saved_layout = self._window.get_layout()
         self._window.set_layout(_LAYOUT_TWO_COL)
+        self._sheet = self._window.new_html_sheet(
+            "Agents", self._build_html(), group=1,
+        )
+        sublime.set_timeout(self._apply_sheet_settings, 80)
+        # Hide tab bar for the right group, then return focus to left group
         self._window.focus_group(1)
-        v = self._window.new_file()
-        v.set_name("Agents")
-        v.set_scratch(True)
-        v.settings().set("sublime_agents_dashboard", True)
-        v.settings().set("gutter",          False)
-        v.settings().set("line_numbers",    False)
-        v.settings().set("word_wrap",       False)
-        v.settings().set("scroll_past_end", False)
-        self._view = v
-        self._render()
+        self._window.run_command("toggle_tabs")
+        self._window.focus_group(0)
         self._start_timer()
 
-    def close(self):
-        v, self._view = self._view, None
-        if v and v.is_valid():
-            v.close()
-        if self._saved_layout is not None:
-            layout, self._saved_layout = self._saved_layout, None
-            sublime.set_timeout(lambda: self._window.set_layout(layout), 100)
+    def _apply_sheet_settings(self):
+        if not self._is_open():
+            return
+        v = self._sheet.view()
+        if not v:
+            return
+        s = v.settings()
+        s.set("sublime_agents_dashboard", True)
+        s.set("show_tabs",             False)
+        s.set("show_minimap",          False)
+        s.set("show_scrollbars",       False)
+        s.set("gutter",                False)
+        s.set("line_numbers",          False)
+        s.set("scroll_past_end",       False)
+        s.set("overlay_scroll_bars",   "enabled")
 
-    def on_view_closed(self, view):
-        """Called by the event listener when the dashboard tab is closed by the user."""
-        if self._view is not None and view.id() == self._view.id():
-            self._view = None
-            if self._saved_layout is not None:
-                layout, self._saved_layout = self._saved_layout, None
-                sublime.set_timeout(lambda: self._window.set_layout(layout), 100)
+    def close(self):
+        self._restore_tabs()
+        sheet, self._sheet = self._sheet, None
+        if sheet is not None:
+            try:
+                sheet.close()
+            except Exception:
+                pass
+        self._restore_layout()
+
+    def _restore_tabs(self):
+        if self._window.num_groups() > 1:
+            self._window.focus_group(1)
+            self._window.run_command("toggle_tabs")
+            self._window.focus_group(0)
+
+    def on_closed(self):
+        """Called when the dashboard sheet is closed externally."""
+        self._sheet = None
+        self._restore_layout()
 
     def update(self, agents):
         self._agents = agents
+        # set_contents must be called on the main thread
+        sublime.set_timeout(self._refresh, 0)
+
+    def _refresh(self):
         if self._is_open():
-            self._render()
+            try:
+                self._sheet.set_contents(self._build_html())
+            except Exception:
+                pass
 
     # ── Private ─────────────────────────────────────────────────────────────
 
     def _is_open(self):
-        return self._view is not None and self._view.is_valid()
+        if self._sheet is None:
+            return False
+        try:
+            sid = self._sheet.id()
+            return any(s.id() == sid for s in self._window.sheets())
+        except Exception:
+            return False
+
+    def _restore_layout(self):
+        if self._saved_layout is not None:
+            layout, self._saved_layout = self._saved_layout, None
+            sublime.set_timeout(lambda: self._window.set_layout(layout), 100)
 
     def _start_timer(self):
         def _tick():
             if not self._is_open():
+                if self._saved_layout is not None:
+                    self._restore_layout()
                 return
-            self._render()
+            try:
+                self._sheet.set_contents(self._build_html())
+            except Exception:
+                pass
             sublime.set_timeout(_tick, 5000)
         sublime.set_timeout(_tick, 5000)
 
-    def _render(self):
-        v = self._view
-        if v is None or not v.is_valid():
-            return
+    def _build_html(self):
+        now    = time.time()
+        agents = self._agents
 
-        now     = time.time()
-        agents  = self._agents
-        lines   = []
-        sids    = []   # ordered session IDs matching rendered header lines
+        def esc(s):
+            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
         if not agents:
-            lines.append("  No agents connected\n")
-            lines.append("  Waiting for Claude Code…\n")
-        else:
-            items = sorted(
-                agents.items(),
-                key=lambda x: (x[1].get("status") == "finished", -x[1].get("last_seen", 0)),
-            )
-            child_map = {}
-            for sid, a in items:
-                p = a.get("parent_session_id")
-                if p:
-                    child_map.setdefault(p, []).append((sid, a))
-            roots = [(sid, a) for sid, a in items if not a.get("parent_session_id")]
+            return (_DASHBOARD_CSS +
+                    "<body><p class='empty'>No agents connected"
+                    "<br>Waiting for Claude Code…</p></body>")
 
-            def _add(sid, agent, depth):
-                sids.append(sid)
-                pad    = "  " * (depth + 1)
-                status = agent.get("status", "active")
-                dot    = "●" if status == "active" else ("⏸" if status == "paused" else "○")
-                atype  = agent.get("type", "agent")
-                short  = sid[:6]
-                action = agent.get("last_action", "")
-                seen   = agent.get("last_seen", now)
-                secs   = int(now - seen)
-                age    = ("{}s".format(secs) if secs < 60
-                          else "{}m".format(secs // 60) if secs < 3600
-                          else "{}h".format(secs // 3600))
-                cwd    = agent.get("cwd", "")
-                nlocks = agent.get("lock_count", 0)
-                arrow  = "↳ " if depth > 0 else ""
+        items = sorted(
+            agents.items(),
+            key=lambda x: (x[1].get("status") == "finished", -x[1].get("last_seen", 0)),
+        )
+        child_map = {}
+        for sid, a in items:
+            p = a.get("parent_session_id")
+            if p:
+                child_map.setdefault(p, []).append((sid, a))
+        roots = [(sid, a) for sid, a in items if not a.get("parent_session_id")]
 
-                lines.append("{}{}{} {}  [{}]\n".format(pad, arrow, dot, atype, short))
-                if action:
-                    lines.append("{}  {}  ·  {}\n".format(pad, action, age))
-                if cwd:
-                    lock_str = ("  ·  {} lock{}".format(nlocks, "s" if nlocks != 1 else "")
-                                if nlocks else "")
-                    lines.append("{}  {}{}\n".format(pad, cwd, lock_str))
-                lines.append("\n")
+        def _short_cwd(path):
+            parts = path.replace("\\", "/").rstrip("/").split("/")
+            return "/".join(parts[-2:]) if len(parts) >= 2 else path
 
-                for csid, ca in child_map.get(sid, []):
-                    _add(csid, ca, depth + 1)
+        def _age(ts):
+            secs = int(now - ts)
+            if secs < 60:   return "{}s".format(secs)
+            if secs < 3600: return "{}m".format(secs // 60)
+            return "{}h".format(secs // 3600)
 
-            for sid, a in roots:
-                _add(sid, a, 0)
+        def block(sid, agent):
+            status    = agent.get("status", "active")
+            reviewing  = agent.get("awaiting_review")   # file path or None
+            nsubagents = agent.get("running_subagents", 0)
+            dot       = "●" if status == "active" else ("⏸" if status == "paused" else "○")
+            color     = _agent_color(sid)
+            atype     = agent.get("type", "agent").replace("_", " ").title()
+            short     = sid[:6]
+            action    = agent.get("last_action", "")
+            seen      = agent.get("last_seen", now)
+            cwd       = agent.get("cwd", "")
+            nlocks    = agent.get("lock_count", 0)
+            st_cls    = ("st-review" if reviewing
+                         else "st-" + (status if status in ("active", "paused", "finished") else "active"))
+            st_label  = "reviewing" if reviewing else status
 
-        text = "".join(lines)
-        v.run_command("sublime_review_set_content", {"text": text})
+            h  = '<div class="agent">'
+            h += '<span class="hdr">'
+            h += '<span class="dot" style="color: {};">{}</span>'.format(color, dot)
+            h += '<span class="name">{}</span>'.format(esc(atype))
+            h += '<span class="sid">[{}]</span>'.format(short)
+            h += '<span class="st {}">{}</span>'.format(st_cls, st_label)
+            h += '</span>'
+            if reviewing:
+                fn = os.path.basename(reviewing)
+                h += '<span class="reviewing">⏳ awaiting review &nbsp;·&nbsp; {}</span>'.format(esc(fn))
+            elif action:
+                h += '<span class="action">{} &nbsp;·&nbsp; {}</span>'.format(esc(action), _age(seen))
+            if nsubagents:
+                label = "subagent" if nsubagents == 1 else "{} subagents".format(nsubagents)
+                h += '<span class="subagent">↳ running {}</span>'.format(label)
+            if cwd:
+                lock_str = ("&nbsp;&nbsp;{}&nbsp;lock{}".format(nlocks, "s" if nlocks != 1 else "")
+                            if nlocks else "")
+                h += '<span class="meta">{}{}</span>'.format(esc(_short_cwd(cwd)), lock_str)
+            children = child_map.get(sid, [])
+            if children:
+                h += '<div class="children">'
+                for csid, ca in children:
+                    h += block(csid, ca)
+                h += '</div>'
+            h += '</div>'
+            return h
 
-        # Erase previous agent regions
-        for i in range(self._prev_count + 5):
-            v.erase_regions("sa_agent_{}".format(i))
-
-        # Add per-agent color annotation on the header line
-        for i, sid in enumerate(sids):
-            marker = "[{}]".format(sid[:6])
-            r = v.find(marker, 0, sublime.LITERAL)
-            if r.a == -1:
-                continue
-            color = _agent_color(sid)
-            v.add_regions(
-                "sa_agent_{}".format(i),
-                [v.line(r)],
-                "", "",
-                sublime.DRAW_NO_FILL | sublime.DRAW_NO_OUTLINE,
-                annotations=[sid[:6]],
-                annotation_color=color,
-            )
-        self._prev_count = len(sids)
+        body = _DASHBOARD_CSS + "<body>"
+        for sid, a in roots:
+            body += block(sid, a)
+        body += "</body>"
+        return body
 
 
 # ===============================================================================
@@ -809,6 +923,7 @@ class _Manager(object):
             lambda: sublime.status_message("SublimeReview: error - " + str(e)), 0)
 
     def _on_close(self):
+        sublime.set_timeout(lambda: self._dashboard.update({}), 0)
         if self._running and _auto_reconnect():
             sublime.set_timeout_async(self._reconnect, _reconnect_delay() * 1000)
 
@@ -876,6 +991,13 @@ class _Manager(object):
                     self._wait_for_inline(loading, review, 0)
         else:
             self._panel.show(review, compact=False)
+        # focus_view() in _inline.show() is async on Linux and its effect can
+        # fire after a 0-ms timeout. Use 100 ms to ensure show_panel always
+        # wins the focus race and keeps Enter/Escape/Tab keybindings active.
+        w = self._window
+        sublime.set_timeout(
+            lambda: w.run_command("show_panel", {"panel": "output." + PANEL_NAME}), 100
+        )
         self._refresh()
 
     def _wait_for_inline(self, v, review, attempts):
@@ -1071,7 +1193,7 @@ class SublimeAgentsDashboardListener(sublime_plugin.EventListener):
         if w:
             m = _managers.get(w.id())
             if m:
-                m._dashboard.on_view_closed(view)
+                m._dashboard.on_closed()
 
 def plugin_loaded():
     _start_server_if_needed()

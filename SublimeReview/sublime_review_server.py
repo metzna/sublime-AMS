@@ -37,6 +37,7 @@ HTTP_PORT = 9876       # hook scripts POST review requests here
 WS_PORT = 9877         # Sublime plugin connects via WebSocket here
 LOCK_TIMEOUT = 600     # seconds before an unresolved lock is force-released
 REVIEW_TIMEOUT = 300   # seconds before a pending review is auto-allowed
+AGENT_TTL = 120        # seconds of inactivity before an agent is removed from the dashboard
 LOG_FILE = "~/.claude/sublime_review_server.log"
 AUDIT_LOG_PATH = os.path.expanduser("~/.local/share/sublime-agents/audit.jsonl")
 
@@ -251,6 +252,13 @@ def _agent_snapshot() -> dict:
     for fp, info in locks.items():
         sid = info["session_id"]
         lock_counts[sid] = lock_counts.get(sid, 0) + 1
+    # Map session_id -> file being reviewed (for agents blocked on review)
+    reviewing: dict = {}
+    for rev in pending_reviews.values():
+        sid = rev.get("session_id", "")
+        fp  = rev.get("file_path", "")
+        if sid and rev.get("decision") is None:
+            reviewing[sid] = fp
     return {
         sid: {
             "type":              a.get("type", "claude_code"),
@@ -261,6 +269,8 @@ def _agent_snapshot() -> dict:
             "parent_session_id": a.get("parent_session_id"),
             "children":          a.get("children", []),
             "lock_count":        lock_counts.get(sid, 0),
+            "awaiting_review":   reviewing.get(sid),
+            "running_subagents": len(a.get("running_subagents", [])),
         }
         for sid, a in agents.items()
     }
@@ -531,6 +541,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
     # ── /subagent/start ───────────────────────────────────────────────────────
 
     def _handle_subagent_start(self):
+        # Subagents share the parent's session_id — no separate registry entry.
+        # We mark the parent as currently delegating to a subagent.
         try:
             body = self.read_body()
         except Exception as e:
@@ -539,25 +551,20 @@ class ReviewHandler(BaseHTTPRequestHandler):
         parent_sid = body.get("parent_session_id", "unknown")
         agent_id   = body.get("agent_id", "")
         agent_type = body.get("agent_type", "subagent")
-        cwd        = body.get("cwd", "")
         if not agent_id:
             self.send_json(400, {"error": "agent_id required"})
             return
         with state_lock:
-            parent = agents.get(parent_sid, {})
-            agents[agent_id] = {
-                "type":              agent_type,
-                "status":            "active",
-                "cwd":               cwd or parent.get("cwd", ""),
-                "last_action":       "started",
-                "last_seen":         time.time(),
-                "parent_session_id": parent_sid,
-                "children":          [],
-            }
-            if parent_sid in agents:
-                children = agents[parent_sid].setdefault("children", [])
-                if agent_id not in children:
-                    children.append(agent_id)
+            if parent_sid not in agents:
+                agents[parent_sid] = {
+                    "type": "claude_code", "status": "active",
+                    "cwd": body.get("cwd", ""), "last_action": "spawning subagent",
+                    "last_seen": time.time(), "parent_session_id": None,
+                    "children": [], "running_subagents": [],
+                }
+            subagents = agents[parent_sid].setdefault("running_subagents", [])
+            if agent_id not in subagents:
+                subagents.append(agent_id)
         log.info("Subagent started: %s (parent: %s)", agent_id, parent_sid)
         _audit("subagent_started", agent_id=agent_id, parent_session_id=parent_sid,
                agent_type=agent_type)
@@ -572,17 +579,18 @@ class ReviewHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json(400, {"error": str(e)})
             return
-        agent_id = body.get("agent_id", "")
+        parent_sid = body.get("parent_session_id", "unknown")
+        agent_id   = body.get("agent_id", "")
         if not agent_id:
             self.send_json(400, {"error": "agent_id required"})
             return
         with state_lock:
-            if agent_id in agents:
-                agents[agent_id]["status"]      = "finished"
-                agents[agent_id]["last_seen"]   = time.time()
-                agents[agent_id]["last_action"] = "finished"
+            if parent_sid in agents:
+                subagents = agents[parent_sid].get("running_subagents", [])
+                if agent_id in subagents:
+                    subagents.remove(agent_id)
         log.info("Subagent finished: %s", agent_id)
-        _audit("subagent_finished", agent_id=agent_id)
+        _audit("subagent_finished", agent_id=agent_id, parent_session_id=parent_sid)
         push_agent_update()
         self.send_json(200, {"ok": True})
 
@@ -601,6 +609,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 agents[session_id]["status"] = "finished"
                 agents[session_id]["last_seen"] = time.time()
                 agents[session_id]["last_action"] = "session ended"
+                agents[session_id]["running_subagents"] = []
         _audit("session_ended", session_id=session_id, released_locks=released)
         push_agent_update()
         self.send_json(200, {"released": released})
@@ -733,12 +742,30 @@ async def run_ws_server() -> None:
         await asyncio.Future()   # run forever
 
 
+# ─── Agent Expiry ─────────────────────────────────────────────────────────────
+
+def expire_agents() -> None:
+    """Remove agents that have been silent longer than AGENT_TTL."""
+    now = time.time()
+    pruned = []
+    with state_lock:
+        for sid in list(agents):
+            a = agents[sid]
+            if now - a.get("last_seen", 0) > AGENT_TTL:
+                pruned.append(sid)
+                del agents[sid]
+    if pruned:
+        log.info("Pruned stale agents: %s", pruned)
+        push_agent_update()
+
+
 # ─── Lock Expiry Watchdog ─────────────────────────────────────────────────────
 
 def lock_expiry_watchdog() -> None:
     while True:
         time.sleep(60)
         expire_locks()
+        expire_agents()
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
