@@ -37,7 +37,8 @@ HTTP_PORT = 9876       # hook scripts POST review requests here
 WS_PORT = 9877         # Sublime plugin connects via WebSocket here
 LOCK_TIMEOUT = 600     # seconds before an unresolved lock is force-released
 REVIEW_TIMEOUT = 300   # seconds before a pending review is auto-allowed
-AGENT_TTL = 120        # seconds of inactivity before an agent is removed from the dashboard
+AGENT_TTL = 600        # seconds of inactivity before an active agent is removed from the dashboard
+AGENT_FINISHED_TTL = 30  # seconds before a "finished" (SessionEnd) agent is removed
 LOG_FILE = "~/.claude/sublime_review_server.log"
 AUDIT_LOG_PATH = os.path.expanduser("~/.local/share/sublime-agents/audit.jsonl")
 
@@ -744,13 +745,14 @@ async def run_ws_server() -> None:
 # ─── Agent Expiry ─────────────────────────────────────────────────────────────
 
 def expire_agents() -> None:
-    """Remove agents that have been silent longer than AGENT_TTL."""
+    """Remove stale agents: finished ones after AGENT_FINISHED_TTL, active after AGENT_TTL."""
     now = time.time()
     pruned = []
     with state_lock:
         for sid in list(agents):
             a = agents[sid]
-            if now - a.get("last_seen", 0) > AGENT_TTL:
+            ttl = AGENT_FINISHED_TTL if a.get("status") == "finished" else AGENT_TTL
+            if now - a.get("last_seen", 0) > ttl:
                 pruned.append(sid)
                 del agents[sid]
     if pruned:
