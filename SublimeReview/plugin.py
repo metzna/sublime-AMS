@@ -658,6 +658,8 @@ class _Manager(object):
             else:
                 # Mark so _next() skips it if it arrives late
                 self._cancelled_ids.add(review_id)
+                if len(self._cancelled_ids) > 200:
+                    self._cancelled_ids.clear()
         if cancelled_active:
             sublime.status_message("SublimeReview: cancelled — file modified by another agent")
             self._next()
