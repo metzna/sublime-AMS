@@ -577,9 +577,6 @@ class _DashboardView(object):
             "Agents", self._build_html(), group=1,
         )
         sublime.set_timeout(self._apply_sheet_settings, 80)
-        # Hide tab bar for the right group, then return focus to left group
-        self._window.focus_group(1)
-        self._window.run_command("toggle_tabs")
         self._window.focus_group(0)
         self._start_timer()
 
@@ -591,7 +588,6 @@ class _DashboardView(object):
             return
         s = v.settings()
         s.set("sublime_agents_dashboard", True)
-        s.set("show_tabs",             False)
         s.set("show_minimap",          False)
         s.set("show_scrollbars",       False)
         s.set("gutter",                False)
@@ -600,7 +596,6 @@ class _DashboardView(object):
         s.set("overlay_scroll_bars",   "enabled")
 
     def close(self):
-        self._restore_tabs()
         sheet, self._sheet = self._sheet, None
         if sheet is not None:
             try:
@@ -608,12 +603,6 @@ class _DashboardView(object):
             except Exception:
                 pass
         self._restore_layout()
-
-    def _restore_tabs(self):
-        if self._window.num_groups() > 1:
-            self._window.focus_group(1)
-            self._window.run_command("toggle_tabs")
-            self._window.focus_group(0)
 
     def on_closed(self):
         """Called when the dashboard sheet is closed externally."""
