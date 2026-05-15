@@ -131,6 +131,12 @@ pending_reviews: dict = {}
 # FIFO queue of review_ids awaiting Sublime
 review_queue: list = []
 
+# session_id → agent info.  Populated on first review from each session;
+# status set to "finished" on SessionEnd.
+# {session_id: {"type": str, "status": str, "cwd": str, "last_action": str,
+#               "last_seen": float, "parent_session_id": str|None}}
+agents: dict = {}
+
 # Connected Sublime WebSocket clients
 ws_clients: set = set()
 
@@ -181,6 +187,34 @@ def push_lock_update() -> None:
             for fp, info in locks.items()
         }
     broadcast_ws({"type": "lock_update", "locks": snapshot})
+
+
+def _agent_snapshot() -> dict:
+    """Build agent snapshot dict. Must be called with state_lock held."""
+    lock_counts: dict = {}
+    for fp, info in locks.items():
+        sid = info["session_id"]
+        lock_counts[sid] = lock_counts.get(sid, 0) + 1
+    return {
+        sid: {
+            "type":              a.get("type", "claude_code"),
+            "status":            a.get("status", "active"),
+            "cwd":               a.get("cwd", ""),
+            "last_action":       a.get("last_action", ""),
+            "last_seen":         a.get("last_seen", 0.0),
+            "parent_session_id": a.get("parent_session_id"),
+            "children":          a.get("children", []),
+            "lock_count":        lock_counts.get(sid, 0),
+        }
+        for sid, a in agents.items()
+    }
+
+
+def push_agent_update() -> None:
+    """Broadcast current agent registry to all Sublime clients."""
+    with state_lock:
+        snapshot = _agent_snapshot()
+    broadcast_ws({"type": "agent_update", "agents": snapshot})
 
 
 def expire_locks() -> None:
@@ -287,6 +321,25 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 "agent_label": label,
                 "locked_since": time.time(),
             }
+
+            # Derive a human-readable action for the dashboard
+            bn = os.path.basename(file_path)
+            if tool_name in ("Edit", "MultiEdit"):
+                last_action = "editing " + bn
+            elif tool_name == "Write":
+                last_action = "writing " + bn
+            else:
+                last_action = tool_name
+            agents[session_id] = {
+                "type":              body.get("agent_type", "claude_code"),
+                "status":            "active",
+                "cwd":               body.get("cwd", ""),
+                "last_action":       last_action,
+                "last_seen":         time.time(),
+                "parent_session_id": body.get("parent_session_id"),
+                "children":          agents.get(session_id, {}).get("children", []),
+            }
+
             review_id = str(uuid.uuid4())
             _ev = Event()
             review_data = {
@@ -303,6 +356,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
             queue_position = queue_total
 
         push_lock_update()
+        push_agent_update()
 
         # Notify Sublime
         ws_message = {
@@ -375,6 +429,12 @@ class ReviewHandler(BaseHTTPRequestHandler):
             return
         session_id = body.get("session_id", "")
         released = release_session_locks(session_id)
+        with state_lock:
+            if session_id in agents:
+                agents[session_id]["status"] = "finished"
+                agents[session_id]["last_seen"] = time.time()
+                agents[session_id]["last_action"] = "session ended"
+        push_agent_update()
         self.send_json(200, {"released": released})
 
     # ── /unlock_file ──────────────────────────────────────────────────────────
@@ -418,11 +478,13 @@ async def ws_handler(websocket) -> None:
 
     # Send current state immediately
     with state_lock:
-        snapshot = {
+        lock_snapshot = {
             fp: {"agent_label": info["agent_label"], "since": info["locked_since"]}
             for fp, info in locks.items()
         }
-    await websocket.send(json.dumps({"type": "lock_update", "locks": snapshot}))
+        agent_snap = _agent_snapshot()
+    await websocket.send(json.dumps({"type": "lock_update", "locks": lock_snapshot}))
+    await websocket.send(json.dumps({"type": "agent_update", "agents": agent_snap}))
 
     # Resend any reviews still waiting for a decision
     with state_lock:

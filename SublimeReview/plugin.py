@@ -24,6 +24,7 @@ import socket
 import struct
 import subprocess
 import threading
+import time
 
 import sublime
 import sublime_plugin
@@ -460,6 +461,178 @@ class _InlineDiff(object):
 
 
 # ===============================================================================
+# Agent dashboard (persistent right-column view)
+# ===============================================================================
+
+_LAYOUT_TWO_COL = {
+    "cols":  [0.0, 0.72, 1.0],
+    "rows":  [0.0, 1.0],
+    "cells": [[0, 0, 1, 1], [1, 0, 2, 1]],
+}
+
+
+class _DashboardView(object):
+    """Manages the agent tree view in a dedicated right column."""
+
+    def __init__(self, window):
+        self._window       = window
+        self._view         = None
+        self._agents       = {}
+        self._saved_layout = None
+        self._prev_count   = 0   # how many sa_agent_N regions were written last render
+
+    # ── Public ──────────────────────────────────────────────────────────────
+
+    def toggle(self):
+        if self._is_open():
+            self.close()
+        else:
+            self.open()
+
+    def open(self):
+        # Reuse view if it survived a plugin reload
+        for v in self._window.views():
+            if v.settings().get("sublime_agents_dashboard"):
+                self._view = v
+                self._window.focus_view(v)
+                self._start_timer()
+                return
+
+        self._saved_layout = self._window.get_layout()
+        self._window.set_layout(_LAYOUT_TWO_COL)
+        self._window.focus_group(1)
+        v = self._window.new_file()
+        v.set_name(" Agents ")
+        v.set_scratch(True)
+        v.set_read_only(True)
+        v.settings().set("sublime_agents_dashboard", True)
+        v.settings().set("gutter",          False)
+        v.settings().set("line_numbers",    False)
+        v.settings().set("word_wrap",       False)
+        v.settings().set("scroll_past_end", False)
+        self._view = v
+        self._render()
+        self._start_timer()
+
+    def close(self):
+        v, self._view = self._view, None
+        if v and v.is_valid():
+            v.close()
+        if self._saved_layout is not None:
+            layout, self._saved_layout = self._saved_layout, None
+            sublime.set_timeout(lambda: self._window.set_layout(layout), 100)
+
+    def on_view_closed(self, view):
+        """Called by the event listener when the dashboard tab is closed by the user."""
+        if self._view is not None and view.id() == self._view.id():
+            self._view = None
+            if self._saved_layout is not None:
+                layout, self._saved_layout = self._saved_layout, None
+                sublime.set_timeout(lambda: self._window.set_layout(layout), 100)
+
+    def update(self, agents):
+        self._agents = agents
+        if self._is_open():
+            self._render()
+
+    # ── Private ─────────────────────────────────────────────────────────────
+
+    def _is_open(self):
+        return self._view is not None and self._view.is_valid()
+
+    def _start_timer(self):
+        def _tick():
+            if not self._is_open():
+                return
+            self._render()
+            sublime.set_timeout(_tick, 5000)
+        sublime.set_timeout(_tick, 5000)
+
+    def _render(self):
+        v = self._view
+        if v is None or not v.is_valid():
+            return
+
+        now     = time.time()
+        agents  = self._agents
+        lines   = []
+        sids    = []   # ordered session IDs matching rendered header lines
+
+        if not agents:
+            lines.append("  No agents connected\n")
+            lines.append("  Waiting for Claude Code…\n")
+        else:
+            items = sorted(
+                agents.items(),
+                key=lambda x: (x[1].get("status") == "finished", -x[1].get("last_seen", 0)),
+            )
+            child_map = {}
+            for sid, a in items:
+                p = a.get("parent_session_id")
+                if p:
+                    child_map.setdefault(p, []).append((sid, a))
+            roots = [(sid, a) for sid, a in items if not a.get("parent_session_id")]
+
+            def _add(sid, agent, depth):
+                sids.append(sid)
+                pad    = "  " * (depth + 1)
+                status = agent.get("status", "active")
+                dot    = "●" if status == "active" else ("⏸" if status == "paused" else "○")
+                atype  = agent.get("type", "agent")
+                short  = sid[:6]
+                action = agent.get("last_action", "")
+                seen   = agent.get("last_seen", now)
+                secs   = int(now - seen)
+                age    = ("{}s".format(secs) if secs < 60
+                          else "{}m".format(secs // 60) if secs < 3600
+                          else "{}h".format(secs // 3600))
+                cwd    = agent.get("cwd", "")
+                nlocks = agent.get("lock_count", 0)
+                arrow  = "↳ " if depth > 0 else ""
+
+                lines.append("{}{}{} {}  [{}]\n".format(pad, arrow, dot, atype, short))
+                if action:
+                    lines.append("{}  {}  ·  {}\n".format(pad, action, age))
+                if cwd:
+                    lock_str = ("  ·  {} lock{}".format(nlocks, "s" if nlocks != 1 else "")
+                                if nlocks else "")
+                    lines.append("{}  {}{}\n".format(pad, cwd, lock_str))
+                lines.append("\n")
+
+                for csid, ca in child_map.get(sid, []):
+                    _add(csid, ca, depth + 1)
+
+            for sid, a in roots:
+                _add(sid, a, 0)
+
+        text = "".join(lines)
+        v.set_read_only(False)
+        v.run_command("sublime_review_set_content", {"text": text})
+        v.set_read_only(True)
+
+        # Erase previous agent regions
+        for i in range(self._prev_count + 5):
+            v.erase_regions("sa_agent_{}".format(i))
+
+        # Add per-agent color annotation on the header line
+        for i, sid in enumerate(sids):
+            marker = "[{}]".format(sid[:6])
+            r = v.find(marker, 0, sublime.LITERAL)
+            if r.a == -1:
+                continue
+            color = _agent_color(sid)
+            v.add_regions(
+                "sa_agent_{}".format(i),
+                [v.line(r)],
+                "", "",
+                sublime.DRAW_NO_FILL | sublime.DRAW_NO_OUTLINE,
+                annotations=[sid[:6]],
+                annotation_color=color,
+            )
+        self._prev_count = len(sids)
+
+
+# ===============================================================================
 # Lock / status indicator
 # ===============================================================================
 
@@ -560,6 +733,7 @@ class _Manager(object):
         self._panel         = _ReviewPanel(window)
         self._inline        = _InlineDiff(window)
         self._ind           = _LockIndicator(window)
+        self._dashboard     = _DashboardView(window)
         self._queue         = []
         self._active        = None
         self._mu            = threading.Lock()
@@ -627,6 +801,9 @@ class _Manager(object):
         elif t == "queue_update":
             n = msg.get("queue_total", 0)
             sublime.set_timeout(lambda: self._ind.set_status(n), 0)
+        elif t == "agent_update":
+            ag = msg.get("agents", {})
+            sublime.set_timeout(lambda: self._dashboard.update(ag), 0)
 
     def _on_err(self, e):
         sublime.set_timeout(
@@ -848,6 +1025,13 @@ class SublimeReviewConnectCommand(sublime_plugin.WindowCommand):
             sublime.status_message("SublimeReview: reconnecting...")
 
 
+class SublimeAgentsDashboardCommand(sublime_plugin.WindowCommand):
+    def run(self):
+        m = _manager(self.window)
+        if m:
+            m._dashboard.toggle()
+
+
 # ===============================================================================
 # Event listeners
 # ===============================================================================
@@ -874,6 +1058,17 @@ class SublimeReviewPanelContext(sublime_plugin.EventListener):
         if operator == sublime.OP_NOT_EQUAL:
             return val != operand
         return None
+
+
+class SublimeAgentsDashboardListener(sublime_plugin.EventListener):
+    def on_pre_close(self, view):
+        if not view.settings().get("sublime_agents_dashboard"):
+            return
+        w = view.window()
+        if w:
+            m = _managers.get(w.id())
+            if m:
+                m._dashboard.on_view_closed(view)
 
 def plugin_loaded():
     _start_server_if_needed()

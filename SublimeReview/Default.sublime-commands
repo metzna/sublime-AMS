@@ -22,5 +22,9 @@
     {
         "caption": "SublimeReview: Reconnect",
         "command": "sublime_review_connect"
+    },
+    {
+        "caption": "SublimeReview: Toggle Agent Dashboard",
+        "command": "sublime_agents_dashboard"
     }
 ]
