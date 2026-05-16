@@ -503,7 +503,7 @@ class _InlineDiff(object):
 
 
 # ===============================================================================
-# Agent dashboard (HTML sheet in a right column)
+# Agent dashboard (phantom in a scratch view, right column)
 # ===============================================================================
 
 _LAYOUT_TWO_COL = {
@@ -568,25 +568,29 @@ body {
 </style>"""
 
 
-_DASH_SHEET_ID_KEY = "sublime_agents_dashboard_sheet_id"
-_DASH_LAYOUT_KEY   = "sublime_agents_dashboard_saved_layout"
+_DASH_VIEW_SETTING    = "sublime_agents_dashboard"
+_DASH_LAYOUT_KEY      = "sublime_agents_dashboard_saved_layout"
+# Legacy key from the HtmlSheet design, used only to migrate old sheets
+_LEGACY_SHEET_ID_KEY  = "sublime_agents_dashboard_sheet_id"
 
 
 class _DashboardView(object):
-    """Manages the agent dashboard as an HTML sheet in a right column.
+    """Agent dashboard rendered as a phantom inside a scratch view.
 
-    Sheet identity is stored in window.settings() so the view can reattach
-    to its sheet after a package reload (HtmlSheet has no backing view, so
-    we can't stamp a marker setting on it).
+    The view is tagged via view.settings()[_DASH_VIEW_SETTING] so we can
+    reattach to it after a plugin reload by scanning window.views().
+    HtmlSheet was the original choice but has no backing view, making
+    reattach impossible — see the legacy migration in _migrate_legacy().
     """
 
     def __init__(self, window):
         self._window       = window
-        self._sheet        = None
+        self._view         = None
+        self._phantom_set  = None
         self._agents       = {}
         self._saved_layout = window.settings().get(_DASH_LAYOUT_KEY)
         self._timer_gen    = 0
-        # If the dashboard was open before a reload, reattach now.
+        self._migrate_legacy()
         self._reattach()
 
     # ── Public ──────────────────────────────────────────────────────────────
@@ -604,49 +608,49 @@ class _DashboardView(object):
         self._saved_layout = self._window.get_layout()
         self._window.settings().set(_DASH_LAYOUT_KEY, self._saved_layout)
         self._window.set_layout(_LAYOUT_TWO_COL)
-        self._sheet = self._window.new_html_sheet(
-            "Agents", self._build_html(), group=1,
-        )
-        self._window.settings().set(_DASH_SHEET_ID_KEY, self._sheet.id())
-        sublime.set_timeout(self._apply_sheet_settings, 80)
+
+        v = self._window.new_file()
+        v.set_name("Agents")
+        v.set_scratch(True)
+        v.set_read_only(True)
+        s = v.settings()
+        s.set(_DASH_VIEW_SETTING, True)
+        s.set("gutter",          False)
+        s.set("line_numbers",    False)
+        s.set("show_minimap",    False)
+        s.set("scroll_past_end", False)
+        s.set("highlight_line",  False)
+        s.set("draw_indent_guides", False)
+        try:
+            self._window.set_view_index(v, 1, 0)
+        except Exception:
+            pass
+        self._view = v
+        self._phantom_set = sublime.PhantomSet(v, "dashboard")
+        self._render()
         self._window.focus_group(0)
         self._start_timer()
 
-    def _apply_sheet_settings(self):
-        if not self._is_open():
-            return
-        v = self._sheet.view()
-        if not v:
-            return
-        s = v.settings()
-        s.set("sublime_agents_dashboard", True)
-        s.set("show_minimap",          False)
-        s.set("show_scrollbars",       False)
-        s.set("gutter",                False)
-        s.set("line_numbers",          False)
-        s.set("scroll_past_end",       False)
-        s.set("overlay_scroll_bars",   "enabled")
-
     def close(self):
         self._timer_gen += 1
-        sheet, self._sheet = self._sheet, None
-        self._window.settings().erase(_DASH_SHEET_ID_KEY)
-        if sheet is not None:
+        view, self._view = self._view, None
+        self._phantom_set = None
+        if view is not None:
             try:
-                sheet.close()
+                view.close()
             except Exception:
                 pass
         self._restore_layout()
 
     def on_closed(self):
-        """Called when the dashboard sheet is closed externally."""
+        """Called when the dashboard view is closed externally."""
         self._timer_gen += 1
-        self._sheet = None
-        self._window.settings().erase(_DASH_SHEET_ID_KEY)
+        self._view = None
+        self._phantom_set = None
         self._restore_layout()
 
     def stop_timer(self):
-        """Kill the running timer without closing the sheet (use on plugin reload / reconnect)."""
+        """Kill the running timer without closing the view (plugin reload)."""
         self._timer_gen += 1
 
     def update(self, agents):
@@ -654,50 +658,73 @@ class _DashboardView(object):
         log.info("dashboard.update window=%d: %d agent(s) [%s]",
                  self._window.id(), len(agents),
                  ", ".join(s[:6] for s in sorted(agents.keys())))
-        # set_contents must be called on the main thread
+        # PhantomSet.update must run on the main thread
         sublime.set_timeout(self._refresh, 0)
 
     def _refresh(self):
         if not self._is_open():
-            # After a package reload _sheet is None but the HTML sheet may still
-            # be visible — scan the window and reattach if found.
             self._reattach()
         if self._is_open():
             try:
-                self._sheet.set_contents(self._build_html())
+                self._render()
             except Exception as e:
-                log.warning("dashboard set_contents failed: %s", e)
+                log.warning("dashboard render failed: %s", e)
         else:
-            log.info("dashboard._refresh window=%d: sheet not open, skipping render",
+            log.info("dashboard._refresh window=%d: view not open, skipping render",
                      self._window.id())
 
-    def _reattach(self):
-        target_id = self._window.settings().get(_DASH_SHEET_ID_KEY)
-        if target_id is None:
+    def _render(self):
+        if self._view is None:
             return
-        for sheet in self._window.sheets():
+        if self._phantom_set is None:
+            self._phantom_set = sublime.PhantomSet(self._view, "dashboard")
+        self._phantom_set.update([
+            sublime.Phantom(sublime.Region(0, 0), self._build_html(),
+                            sublime.LAYOUT_BLOCK)
+        ])
+
+    def _reattach(self):
+        for v in self._window.views():
             try:
-                if sheet.id() == target_id:
-                    self._sheet = sheet
-                    log.info("dashboard reattached window=%d sheet=%d",
-                             self._window.id(), target_id)
+                if v.settings().get(_DASH_VIEW_SETTING):
+                    self._view = v
+                    # Erase orphan phantoms left behind by the previous plugin
+                    # instance — PhantomSet doesn't know about them and would
+                    # render a duplicate on top.
+                    v.erase_phantoms("dashboard")
+                    self._phantom_set = sublime.PhantomSet(v, "dashboard")
+                    log.info("dashboard reattached window=%d view=%d",
+                             self._window.id(), v.id())
+                    self._render()
                     self._start_timer()
                     return
             except Exception:
                 pass
-        # Marker is stale — sheet was closed externally
-        log.info("dashboard reattach window=%d: sheet %d no longer exists, clearing marker",
-                 self._window.id(), target_id)
-        self._window.settings().erase(_DASH_SHEET_ID_KEY)
+
+    def _migrate_legacy(self):
+        """Close the HtmlSheet from the previous dashboard design, if any."""
+        old_id = self._window.settings().get(_LEGACY_SHEET_ID_KEY)
+        if old_id is None:
+            return
+        for sheet in self._window.sheets():
+            try:
+                if sheet.id() == old_id:
+                    sheet.close()
+                    log.info("dashboard migration: closed legacy HtmlSheet=%d window=%d",
+                             old_id, self._window.id())
+                    break
+            except Exception:
+                pass
+        self._window.settings().erase(_LEGACY_SHEET_ID_KEY)
 
     # ── Private ─────────────────────────────────────────────────────────────
 
     def _is_open(self):
-        if self._sheet is None:
+        if self._view is None:
             return False
         try:
-            sid = self._sheet.id()
-            return any(s.id() == sid for s in self._window.sheets())
+            vid = self._view.id()
+            return any(v.id() == vid for v in self._window.views())
         except Exception:
             return False
 
@@ -718,7 +745,7 @@ class _DashboardView(object):
                     self._restore_layout()
                 return
             try:
-                self._sheet.set_contents(self._build_html())
+                self._render()
             except Exception:
                 pass
             sublime.set_timeout(_tick, 5000)
@@ -1293,7 +1320,7 @@ class SublimeReviewPanelContext(sublime_plugin.EventListener):
 
 class SublimeAgentsDashboardListener(sublime_plugin.EventListener):
     def on_pre_close(self, view):
-        if not view.settings().get("sublime_agents_dashboard"):
+        if not view.settings().get(_DASH_VIEW_SETTING):
             return
         w = view.window()
         if w:
