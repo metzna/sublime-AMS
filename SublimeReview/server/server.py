@@ -14,150 +14,31 @@ Coordinates Claude Code PreToolUse reviews via two transports:
 
 State is held entirely in memory and is lost on server restart.  This is
 intentional — locks and queued reviews are short-lived by design.
+
+This module is launched as a standalone script by the plugin.  It adds its
+own directory to sys.path so the sibling modules `config` and `hookmanager`
+import cleanly without requiring the parent package to be importable.
 """
+
+import os
+import sys
+
+# Make sibling modules importable when launched as a script
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import asyncio
 import json
 import logging
-import os
-import tempfile
 import time
 import uuid
-from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
-from threading import Thread, Lock, Event
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread, Lock, Event, Timer
 from typing import Optional
 
 import websockets
 
-# ─── Configuration ───────────────────────────────────────────────────────────
-# Adjust these at the top of the file; no restart needed for LOCK_TIMEOUT
-# (it is checked lazily), but HTTP/WS ports require a server restart.
-
-HTTP_PORT = 9876       # hook scripts POST review requests here
-WS_PORT = 9877         # Sublime plugin connects via WebSocket here
-LOCK_TIMEOUT = 600     # seconds before an unresolved lock is force-released
-REVIEW_TIMEOUT = 300   # seconds before a pending review is auto-allowed
-AGENT_TTL = 1800       # seconds of inactivity before an active agent is removed from the dashboard
-AGENT_FINISHED_TTL = 30  # seconds before a "finished" (SessionEnd) agent is removed
-IDLE_SHUTDOWN_SECONDS = 8   # exit after this many seconds with no WS clients (longer than plugin reconnect_delay)
-LOG_FILE = os.path.expanduser("~/.claude/sublime_review_server.log")
-AUDIT_LOG_PATH = os.path.expanduser("~/.local/share/sublime-agents/audit.jsonl")
-
-# ─── Hook management ─────────────────────────────────────────────────────────
-# Hooks are written into ~/.claude/settings.json when the first Sublime client
-# connects and removed when the last client disconnects.  This means reviews
-# only intercept Claude when Sublime Text is actually open — including after a
-# Sublime crash, because the WebSocket disconnect triggers _disable_hooks().
-
-_HOOKS_DIR            = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks")
-_REVIEW_CMD           = "python3 " + os.path.join(_HOOKS_DIR, "sublime_review.py")
-_ACTIVITY_CMD         = "python3 " + os.path.join(_HOOKS_DIR, "activity.py")
-_POST_TOOL_CMD        = "python3 " + os.path.join(_HOOKS_DIR, "post_tool_use.py")
-_SESSION_START_CMD    = "python3 " + os.path.join(_HOOKS_DIR, "session_start.py")
-_SESSION_END_CMD      = "python3 " + os.path.join(_HOOKS_DIR, "sublime_session_end.py")
-_SUBAGENT_START_CMD   = "python3 " + os.path.join(_HOOKS_DIR, "subagent_start.py")
-_SUBAGENT_STOP_CMD    = "python3 " + os.path.join(_HOOKS_DIR, "subagent_stop.py")
-_SETTINGS_PATH        = os.path.expanduser("~/.claude/settings.json")
-
-
-def _first_hook_command(entry):
-    hooks = entry.get("hooks", [])
-    return hooks[0].get("command", "") if hooks else ""
-
-
-# Script filenames that belong to this plugin.  Matched by basename so that
-# stale entries from a different installation path are also recognised.
-_OUR_HOOK_BASENAMES = frozenset({
-    "sublime_review.py",
-    "activity.py",
-    "post_tool_use.py",
-    "session_start.py",
-    "sublime_session_end.py",
-    "subagent_start.py",
-    "subagent_stop.py",
-})
-
-
-def _hook_basename(entry) -> str:
-    """Return the script filename from a hook entry (e.g. 'sublime_review.py')."""
-    cmd = _first_hook_command(entry)
-    parts = cmd.split() if cmd else []
-    return os.path.basename(parts[-1]) if parts else ""
-
-
-def _is_our_hook(entry) -> bool:
-    return _hook_basename(entry) in _OUR_HOOK_BASENAMES
-
-
-def _atomic_write_json(path, data):
-    dir_ = os.path.dirname(path) or "."
-    fd, tmp = tempfile.mkstemp(dir=dir_, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except Exception:
-            pass
-        raise
-
-
-def _enable_hooks():
-    try:
-        with open(_SETTINGS_PATH) as f:
-            data = json.load(f)
-    except Exception:
-        data = {}
-    hooks = data.setdefault("hooks", {})
-    # Remove any stale entries from other installation paths before adding ours
-    _purge_our_hooks(hooks)
-    hooks.setdefault("PreToolUse", []).extend([
-        {"hooks": [{"type": "command", "command": _ACTIVITY_CMD, "timeout": 10}]},
-        {"matcher": "Edit|Write|MultiEdit",
-         "hooks": [{"type": "command", "command": _REVIEW_CMD, "timeout": 300}]},
-    ])
-    hooks.setdefault("PostToolUse", []).append(
-        {"hooks": [{"type": "command", "command": _POST_TOOL_CMD, "timeout": 10}]}
-    )
-    hooks.setdefault("SessionStart", []).append(
-        {"hooks": [{"type": "command", "command": _SESSION_START_CMD, "timeout": 10}]}
-    )
-    hooks.setdefault("SessionEnd", []).append(
-        {"hooks": [{"type": "command", "command": _SESSION_END_CMD}]}
-    )
-    hooks.setdefault("SubagentStart", []).append(
-        {"hooks": [{"type": "command", "command": _SUBAGENT_START_CMD, "timeout": 10}]}
-    )
-    hooks.setdefault("SubagentStop", []).append(
-        {"hooks": [{"type": "command", "command": _SUBAGENT_STOP_CMD, "timeout": 10}]}
-    )
-    _atomic_write_json(_SETTINGS_PATH, data)
-    log.info("Hooks enabled")
-
-
-def _purge_our_hooks(hooks: dict) -> None:
-    """Remove all entries that belong to this plugin (matched by script basename)."""
-    for key in ("PreToolUse", "PostToolUse", "SessionStart", "SessionEnd", "SubagentStart", "SubagentStop"):
-        hooks[key] = [e for e in hooks.get(key, []) if not _is_our_hook(e)]
-
-
-def _disable_hooks():
-    try:
-        with open(_SETTINGS_PATH) as f:
-            data = json.load(f)
-    except Exception:
-        return
-    hooks = data.get("hooks", {})
-    _purge_our_hooks(hooks)
-    for key in ("PreToolUse", "PostToolUse", "SessionStart", "SessionEnd", "SubagentStart", "SubagentStop"):
-        if not hooks.get(key):
-            hooks.pop(key, None)
-    if not hooks:
-        data.pop("hooks", None)
-    _atomic_write_json(_SETTINGS_PATH, data)
-    log.info("Hooks disabled")
+import config
+from hookmanager import enable_hooks, disable_hooks
 
 
 # ─── State (all guarded by state_lock) ───────────────────────────────────────
@@ -180,8 +61,6 @@ review_queue: list = []
 
 # session_id → agent info.  Populated on first review from each session;
 # status set to "finished" on SessionEnd.
-# {session_id: {"type": str, "status": str, "cwd": str, "last_action": str,
-#               "last_seen": float, "parent_session_id": str|None}}
 agents: dict = {}
 
 # Connected Sublime WebSocket clients
@@ -193,11 +72,12 @@ ws_loop: Optional[asyncio.AbstractEventLoop] = None
 # Audit log write lock (separate from state_lock to avoid contention)
 _audit_lock = Lock()
 
+
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
 try:
-    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-    _file_handler = logging.FileHandler(LOG_FILE)
+    os.makedirs(os.path.dirname(config.LOG_FILE), exist_ok=True)
+    _file_handler = logging.FileHandler(config.LOG_FILE)
 except Exception:
     _file_handler = None
 
@@ -218,10 +98,10 @@ log = logging.getLogger("server")
 def _audit(event_type: str, **kwargs) -> None:
     """Append one event line to the append-only audit JSONL (best-effort)."""
     try:
-        os.makedirs(os.path.dirname(AUDIT_LOG_PATH), exist_ok=True)
+        os.makedirs(os.path.dirname(config.AUDIT_LOG_PATH), exist_ok=True)
         record = json.dumps({"ts": time.time(), "event": event_type, **kwargs})
         with _audit_lock:
-            with open(AUDIT_LOG_PATH, "a") as f:
+            with open(config.AUDIT_LOG_PATH, "a") as f:
                 f.write(record + "\n")
     except Exception:
         pass
@@ -312,7 +192,7 @@ def expire_locks() -> None:
     expired = []
     with state_lock:
         for fp, info in list(locks.items()):
-            if now - info["locked_since"] > LOCK_TIMEOUT:
+            if now - info["locked_since"] > config.LOCK_TIMEOUT:
                 expired.append(fp)
                 del locks[fp]
     if expired:
@@ -477,7 +357,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
         log.info("Review queued: %s  file=%s  session=%s", review_id, file_path, session_id)
 
         # Block until decision or timeout
-        _ev.wait(timeout=REVIEW_TIMEOUT)
+        _ev.wait(timeout=config.REVIEW_TIMEOUT)
         with state_lock:
             _rev = pending_reviews.get(review_id, {})
             decision = _rev.get("decision")
@@ -689,7 +569,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self.send_json(200, {"ok": True})
         log.info("Received /shutdown — exiting")
         # Exit from a background thread so the HTTP response flushes first
-        _Timer(0.1, lambda: os._exit(0)).start()
+        Timer(0.1, lambda: os._exit(0)).start()
 
 
 def _broadcast_queue_positions() -> None:
@@ -708,8 +588,6 @@ def _broadcast_queue_positions() -> None:
 # We only arm the shutdown once at least one client has connected, so the
 # server doesn't die before the first Sublime ever attaches.
 
-from threading import Timer as _Timer
-
 _idle_shutdown_timer = None
 _idle_shutdown_lock = Lock()
 _had_a_client = False
@@ -722,9 +600,9 @@ def _schedule_idle_shutdown() -> None:
             _idle_shutdown_timer.cancel()
         def _shutdown():
             if len(ws_clients) == 0:
-                log.info("No WS clients for %d s — exiting", IDLE_SHUTDOWN_SECONDS)
+                log.info("No WS clients for %d s — exiting", config.IDLE_SHUTDOWN_SECONDS)
                 os._exit(0)
-        _idle_shutdown_timer = _Timer(IDLE_SHUTDOWN_SECONDS, _shutdown)
+        _idle_shutdown_timer = Timer(config.IDLE_SHUTDOWN_SECONDS, _shutdown)
         _idle_shutdown_timer.daemon = True
         _idle_shutdown_timer.start()
 
@@ -746,7 +624,7 @@ async def ws_handler(websocket) -> None:
     _cancel_idle_shutdown()
     log.info("Sublime connected (total clients: %d)", len(ws_clients))
     if len(ws_clients) == 1:
-        _enable_hooks()
+        enable_hooks()
 
     # Send current state immediately
     with state_lock:
@@ -826,7 +704,7 @@ async def ws_handler(websocket) -> None:
         ws_clients.discard(websocket)
         log.info("Sublime disconnected (total clients: %d)", len(ws_clients))
         if len(ws_clients) == 0:
-            _disable_hooks()
+            disable_hooks()
             if _had_a_client:
                 _schedule_idle_shutdown()
 
@@ -834,8 +712,8 @@ async def ws_handler(websocket) -> None:
 async def run_ws_server() -> None:
     global ws_loop
     ws_loop = asyncio.get_event_loop()
-    async with websockets.serve(ws_handler, "localhost", WS_PORT):
-        log.info("WebSocket server listening on ws://localhost:%d", WS_PORT)
+    async with websockets.serve(ws_handler, "localhost", config.WS_PORT):
+        log.info("WebSocket server listening on ws://localhost:%d", config.WS_PORT)
         await asyncio.Future()   # run forever
 
 
@@ -848,7 +726,7 @@ def expire_agents() -> None:
     with state_lock:
         for sid in list(agents):
             a = agents[sid]
-            ttl = AGENT_FINISHED_TTL if a.get("status") == "finished" else AGENT_TTL
+            ttl = config.AGENT_FINISHED_TTL if a.get("status") == "finished" else config.AGENT_TTL
             if now - a.get("last_seen", 0) > ttl:
                 pruned.append(sid)
                 del agents[sid]
@@ -870,7 +748,7 @@ def lock_expiry_watchdog() -> None:
 
 def main() -> None:
     log.info("Starting Sublime Review Server")
-    _disable_hooks()  # clean up any hooks left over from a previous crash
+    disable_hooks()  # clean up any hooks left over from a previous crash
 
     # WebSocket in its own thread with its own event loop
     def _ws_thread():
@@ -884,8 +762,8 @@ def main() -> None:
     wd_t.start()
 
     # HTTP server (blocking, main thread)
-    server = ThreadingHTTPServer(("localhost", HTTP_PORT), ReviewHandler)
-    log.info("HTTP server listening on http://localhost:%d", HTTP_PORT)
+    server = ThreadingHTTPServer(("localhost", config.HTTP_PORT), ReviewHandler)
+    log.info("HTTP server listening on http://localhost:%d", config.HTTP_PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

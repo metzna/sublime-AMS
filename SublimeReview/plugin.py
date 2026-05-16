@@ -31,6 +31,11 @@ import time
 import sublime
 import sublime_plugin
 
+from SublimeReview.settings import (
+    _host, _port, _auto_reconnect, _reconnect_delay,
+    _context_lines, _status_prefix,
+)
+
 # ===============================================================================
 # Diagnostic logging — shared file with the server, distinguished by logger name
 # ===============================================================================
@@ -49,26 +54,6 @@ if not log.handlers:
         log.addHandler(_h)
     except Exception:
         pass
-
-# ===============================================================================
-# Settings
-# ===============================================================================
-
-SETTINGS_FILE = "SublimeReview.sublime-settings"
-
-
-def _s(key, default=None):
-    return sublime.load_settings(SETTINGS_FILE).get(key, default)
-
-
-def _host():            return _s("server_host", "localhost")
-def _port():            return int(_s("server_port", 9877))
-def _auto_reconnect():  return bool(_s("auto_reconnect", True))
-def _reconnect_delay(): return int(_s("reconnect_delay", 3))
-def _context_lines():   return int(_s("diff_context_lines", 3))
-def _status_prefix():   return _s("status_bar_prefix", "Claude Review")
-def _lock_icon():       return _s("lock_icon", "[locked]")
-
 
 # ===============================================================================
 # WebSocket client (RFC 6455, stdlib only)
@@ -292,12 +277,6 @@ def _build_phantom_html(text):
         '{}</div></body>'
     ).format(lines)
 
-
-class SublimeReviewSetContentCommand(sublime_plugin.TextCommand):
-    """Internal command: replace entire view content."""
-    def run(self, edit, text=""):
-        self.view.erase(edit, sublime.Region(0, self.view.size()))
-        self.view.insert(edit, 0, text)
 
 class _ReviewPanel(object):
     def __init__(self, window):
@@ -905,7 +884,7 @@ def _start_server_if_needed():
             return  # already running
         except Exception:
             pass
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sublime_review_server.py")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server", "server.py")
         if not os.path.exists(script):
             sublime.status_message("SublimeReview: server script not found: " + script)
             return
@@ -1062,6 +1041,8 @@ class _Manager(object):
                     self._cancelled_ids.clear()
         if cancelled_active:
             sublime.status_message("SublimeReview: cancelled — file modified by another agent")
+            self._inline.clear()
+            self._panel.clear()
             self._next()
         else:
             self._refresh()
@@ -1153,6 +1134,9 @@ class _Manager(object):
     def _decide(self, decision, reason=""):
         with self._mu:
             review = self._active
+            if review and review.get("review_id") in self._cancelled_ids:
+                self._cancelled_ids.discard(review.get("review_id"))
+                review = None
         if review is None:
             return
         msg = {
@@ -1184,104 +1168,6 @@ class _Manager(object):
             except Exception as e:
                 sublime.set_timeout(
                     lambda: sublime.status_message("SublimeReview: send error - " + str(e)), 0)
-
-
-# ===============================================================================
-# Commands
-# ===============================================================================
-
-class SublimeReviewAcceptCommand(sublime_plugin.WindowCommand):
-    def run(self):
-        m = _manager(self.window)
-        if m:
-            m.accept()
-
-
-class SublimeReviewRejectCommand(sublime_plugin.WindowCommand):
-    def run(self):
-        m = _manager(self.window)
-        if not m:
-            return
-        self.window.show_input_panel(
-            "Rejection reason (optional, Enter to confirm, Escape to skip):",
-            "",
-            lambda reason: m.reject(reason.strip()),  # Enter
-            None,
-            lambda: m.reject(""),                     # Escape
-        )
-
-
-class SublimeReviewNextCommand(sublime_plugin.WindowCommand):
-    def run(self):
-        m = _manager(self.window)
-        if m:
-            m.cycle()
-
-
-class SublimeReviewShowCommand(sublime_plugin.WindowCommand):
-    def run(self):
-        m = _manager(self.window)
-        if m:
-            m.show_current()
-
-    def is_enabled(self):
-        m = _managers.get(self.window.id())
-        return m is not None and m.has_pending()
-
-
-class SublimeReviewToggleInlineCommand(sublime_plugin.WindowCommand):
-    def run(self):
-        m = _manager(self.window)
-        if not m:
-            return
-        with m._mu:
-            review = m._active
-        if review is None or review.get("tool_name", "") not in ("Edit", "MultiEdit"):
-            return
-        if m._inline._phantom_set is not None:
-            m._inline.clear()
-            m._panel.show(review, compact=False, has_inline=False)
-        else:
-            ok = m._inline.show(review)
-            if ok:
-                m._panel.show(review, compact=True, has_inline=True)
-            else:
-                fp = review.get("file_path", "")
-                loading = m._window.find_open_file(fp)
-                if loading is not None and loading.is_loading():
-                    m._wait_for_inline(loading, review, 0)
-                else:
-                    sublime.status_message("SublimeReview: could not show inline diff")
-        self.window.run_command("show_panel", {"panel": "output." + PANEL_NAME})
-
-
-class SublimeReviewUnlockFileCommand(sublime_plugin.WindowCommand):
-    def run(self, file_path=""):
-        if not file_path:
-            v = self.window.active_view()
-            file_path = v.file_name() if v else ""
-        if not file_path:
-            sublime.status_message("SublimeReview: no file selected")
-            return
-        m = _manager(self.window)
-        if m:
-            m.unlock_file(file_path)
-
-
-class SublimeReviewConnectCommand(sublime_plugin.WindowCommand):
-    def run(self):
-        m = _manager(self.window)
-        if m:
-            m.stop()
-            m.start()
-            sublime.status_message("SublimeReview: reconnecting...")
-
-
-class SublimeAgentsDashboardCommand(sublime_plugin.WindowCommand):
-    def run(self):
-        m = _manager(self.window)
-        if m:
-            m._dashboard.toggle()
 
 
 # ===============================================================================
