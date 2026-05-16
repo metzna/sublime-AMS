@@ -657,6 +657,9 @@ class _DashboardView(object):
         if self._view is None:
             return
         if self._phantom_set is None:
+            # _view is set but we don't yet track any phantoms — clear orphans
+            # from a previous PhantomSet first, otherwise they stack on ours.
+            self._view.erase_phantoms("dashboard")
             self._phantom_set = sublime.PhantomSet(self._view, "dashboard")
         self._phantom_set.update([
             sublime.Phantom(sublime.Region(0, 0), self._build_html(),
