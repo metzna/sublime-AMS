@@ -52,6 +52,7 @@ _HOOKS_DIR            = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 _REVIEW_CMD           = "python3 " + os.path.join(_HOOKS_DIR, "sublime_review.py")
 _ACTIVITY_CMD         = "python3 " + os.path.join(_HOOKS_DIR, "activity.py")
 _POST_TOOL_CMD        = "python3 " + os.path.join(_HOOKS_DIR, "post_tool_use.py")
+_SESSION_START_CMD    = "python3 " + os.path.join(_HOOKS_DIR, "session_start.py")
 _SESSION_END_CMD      = "python3 " + os.path.join(_HOOKS_DIR, "sublime_session_end.py")
 _SUBAGENT_START_CMD   = "python3 " + os.path.join(_HOOKS_DIR, "subagent_start.py")
 _SUBAGENT_STOP_CMD    = "python3 " + os.path.join(_HOOKS_DIR, "subagent_stop.py")
@@ -69,6 +70,7 @@ _OUR_HOOK_BASENAMES = frozenset({
     "sublime_review.py",
     "activity.py",
     "post_tool_use.py",
+    "session_start.py",
     "sublime_session_end.py",
     "subagent_start.py",
     "subagent_stop.py",
@@ -118,6 +120,9 @@ def _enable_hooks():
     hooks.setdefault("PostToolUse", []).append(
         {"hooks": [{"type": "command", "command": _POST_TOOL_CMD, "timeout": 10}]}
     )
+    hooks.setdefault("SessionStart", []).append(
+        {"hooks": [{"type": "command", "command": _SESSION_START_CMD, "timeout": 10}]}
+    )
     hooks.setdefault("SessionEnd", []).append(
         {"hooks": [{"type": "command", "command": _SESSION_END_CMD}]}
     )
@@ -133,7 +138,7 @@ def _enable_hooks():
 
 def _purge_our_hooks(hooks: dict) -> None:
     """Remove all entries that belong to this plugin (matched by script basename)."""
-    for key in ("PreToolUse", "PostToolUse", "SessionEnd", "SubagentStart", "SubagentStop"):
+    for key in ("PreToolUse", "PostToolUse", "SessionStart", "SessionEnd", "SubagentStart", "SubagentStop"):
         hooks[key] = [e for e in hooks.get(key, []) if not _is_our_hook(e)]
 
 
@@ -145,7 +150,7 @@ def _disable_hooks():
         return
     hooks = data.get("hooks", {})
     _purge_our_hooks(hooks)
-    for key in ("PreToolUse", "PostToolUse", "SessionEnd", "SubagentStart", "SubagentStop"):
+    for key in ("PreToolUse", "PostToolUse", "SessionStart", "SessionEnd", "SubagentStart", "SubagentStop"):
         if not hooks.get(key):
             hooks.pop(key, None)
     if not hooks:
@@ -508,17 +513,35 @@ class ReviewHandler(BaseHTTPRequestHandler):
         cwd         = body.get("cwd", "")
 
         if event_type == "post_tool_use":
-            # PostToolUse: write audit log only, don't update dashboard action
             tool_name      = body.get("tool_name", "")
             result_summary = body.get("result_summary")
             result_snippet = body.get("result_snippet", "")
             _audit("post_tool_use", session_id=session_id,
                    tool_name=tool_name, result_summary=result_summary,
                    result_snippet=result_snippet)
-            # Update last_seen so the agent doesn't appear stale
             with state_lock:
                 if session_id in agents:
                     agents[session_id]["last_seen"] = time.time()
+                    if result_summary:
+                        agents[session_id]["last_action"] = result_summary
+            if result_summary:
+                push_agent_update()
+        elif event_type == "session_start":
+            source = body.get("source", "startup")
+            action = "session resumed" if source == "resume" else "session started"
+            with state_lock:
+                existing = agents.get(session_id, {})
+                agents[session_id] = {
+                    "type":              existing.get("type", "claude_code"),
+                    "status":            "active",
+                    "cwd":               cwd or existing.get("cwd", ""),
+                    "last_action":       action,
+                    "last_seen":         time.time(),
+                    "parent_session_id": existing.get("parent_session_id"),
+                    "running_subagents": existing.get("running_subagents", []),
+                }
+            _audit("session_start", session_id=session_id, source=source)
+            push_agent_update()
         else:
             # PreToolUse: update dashboard action + write audit
             action = body.get("action", "")
