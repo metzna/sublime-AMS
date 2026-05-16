@@ -13,6 +13,7 @@
 #
 # Requires Python 3.8+ (.python-version pins Sublime's host to 3.8).
 
+import atexit
 import base64
 import difflib
 import hashlib
@@ -865,7 +866,6 @@ class _LockIndicator(object):
 # ===============================================================================
 
 _managers = {}
-_server_proc = None
 _server_start_lock = threading.Lock()
 _DISABLED = False   # set to True when running as root
 
@@ -897,7 +897,6 @@ def _manager(window=None):
 
 
 def _start_server_if_needed():
-    global _server_proc
     with _server_start_lock:
         try:
             conn = http.client.HTTPConnection("localhost", 9876, timeout=1)
@@ -911,7 +910,7 @@ def _start_server_if_needed():
             sublime.status_message("SublimeReview: server script not found: " + script)
             return
         try:
-            _server_proc = subprocess.Popen(
+            subprocess.Popen(
                 ["python3", script],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -1328,6 +1327,19 @@ class SublimeAgentsDashboardListener(sublime_plugin.EventListener):
             if m:
                 m._dashboard.on_closed()
 
+def _shutdown_server_on_exit():
+    """Tell the server to exit. Registered via atexit so it fires only on
+    actual Sublime quit, not on plugin reload (which goes through
+    plugin_unloaded but leaves the interpreter alive)."""
+    try:
+        conn = http.client.HTTPConnection("localhost", 9876, timeout=0.5)
+        conn.request("POST", "/shutdown")
+        conn.getresponse()
+        conn.close()
+    except Exception:
+        pass
+
+
 def plugin_loaded():
     global _DISABLED
     if _is_root():
@@ -1337,21 +1349,18 @@ def plugin_loaded():
         )
         return
     _start_server_if_needed()
+    # Re-registering is a no-op if the same callable is already in the list,
+    # so this is safe across plugin reloads.
+    atexit.register(_shutdown_server_on_exit)
 
 
-# Called by Sublime when the plugin is unloaded (e.g. on plugin reload).
-# Closes all WebSocket connections and terminates the review server.
-# The server removes hook entries from ~/.claude/settings.json when it
-# detects the last client has disconnected.
+# Called by Sublime when the plugin is unloaded — fires on both plugin reload
+# AND Sublime quit, so we don't kill the server here (would lose state on
+# every file save). The server's idle-shutdown timer handles abnormal exits;
+# the atexit handler handles clean Sublime quit.
 def plugin_unloaded():
-    global _server_proc, _DISABLED
+    global _DISABLED
     _DISABLED = False
     for m in list(_managers.values()):
         m.stop()
     _managers.clear()
-    if _server_proc is not None:
-        try:
-            _server_proc.terminate()
-        except Exception:
-            pass
-        _server_proc = None

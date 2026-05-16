@@ -39,6 +39,7 @@ LOCK_TIMEOUT = 600     # seconds before an unresolved lock is force-released
 REVIEW_TIMEOUT = 300   # seconds before a pending review is auto-allowed
 AGENT_TTL = 1800       # seconds of inactivity before an active agent is removed from the dashboard
 AGENT_FINISHED_TTL = 30  # seconds before a "finished" (SessionEnd) agent is removed
+IDLE_SHUTDOWN_SECONDS = 8   # exit after this many seconds with no WS clients (longer than plugin reconnect_delay)
 LOG_FILE = os.path.expanduser("~/.claude/sublime_review_server.log")
 AUDIT_LOG_PATH = os.path.expanduser("~/.local/share/sublime-agents/audit.jsonl")
 
@@ -375,6 +376,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self._handle_unlock_file()
         elif self.path == "/status":
             self._handle_status()
+        elif self.path == "/shutdown":
+            self._handle_shutdown()
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -679,6 +682,15 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 "agents": _agent_snapshot(),
             })
 
+    # ── /shutdown ─────────────────────────────────────────────────────────────
+
+    def _handle_shutdown(self):
+        """Exit the server. Called by the plugin's atexit handler on Sublime quit."""
+        self.send_json(200, {"ok": True})
+        log.info("Received /shutdown — exiting")
+        # Exit from a background thread so the HTTP response flushes first
+        _Timer(0.1, lambda: os._exit(0)).start()
+
 
 def _broadcast_queue_positions() -> None:
     """Tell Sublime about updated queue sizes after a review resolves."""
@@ -687,10 +699,51 @@ def _broadcast_queue_positions() -> None:
     broadcast_ws({"type": "queue_update", "queue_total": total})
 
 
+# ─── Idle shutdown ────────────────────────────────────────────────────────────
+# When the last Sublime client disconnects, the server schedules itself to exit.
+# This lets state survive a plugin reload (WS reconnects within ~3 s) while
+# guaranteeing a fresh process — and therefore a fresh agents registry — on
+# Sublime restart (no client reconnects within the grace period).
+#
+# We only arm the shutdown once at least one client has connected, so the
+# server doesn't die before the first Sublime ever attaches.
+
+from threading import Timer as _Timer
+
+_idle_shutdown_timer = None
+_idle_shutdown_lock = Lock()
+_had_a_client = False
+
+
+def _schedule_idle_shutdown() -> None:
+    global _idle_shutdown_timer
+    with _idle_shutdown_lock:
+        if _idle_shutdown_timer is not None:
+            _idle_shutdown_timer.cancel()
+        def _shutdown():
+            if len(ws_clients) == 0:
+                log.info("No WS clients for %d s — exiting", IDLE_SHUTDOWN_SECONDS)
+                os._exit(0)
+        _idle_shutdown_timer = _Timer(IDLE_SHUTDOWN_SECONDS, _shutdown)
+        _idle_shutdown_timer.daemon = True
+        _idle_shutdown_timer.start()
+
+
+def _cancel_idle_shutdown() -> None:
+    global _idle_shutdown_timer
+    with _idle_shutdown_lock:
+        if _idle_shutdown_timer is not None:
+            _idle_shutdown_timer.cancel()
+            _idle_shutdown_timer = None
+
+
 # ─── WebSocket Server ─────────────────────────────────────────────────────────
 
 async def ws_handler(websocket) -> None:
+    global _had_a_client
     ws_clients.add(websocket)
+    _had_a_client = True
+    _cancel_idle_shutdown()
     log.info("Sublime connected (total clients: %d)", len(ws_clients))
     if len(ws_clients) == 1:
         _enable_hooks()
@@ -774,6 +827,8 @@ async def ws_handler(websocket) -> None:
         log.info("Sublime disconnected (total clients: %d)", len(ws_clients))
         if len(ws_clients) == 0:
             _disable_hooks()
+            if _had_a_client:
+                _schedule_idle_shutdown()
 
 
 async def run_ws_server() -> None:
