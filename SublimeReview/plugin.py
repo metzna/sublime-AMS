@@ -19,6 +19,7 @@ import hashlib
 import html as _html
 import http.client
 import json
+import logging
 import os
 import socket
 import struct
@@ -28,6 +29,25 @@ import time
 
 import sublime
 import sublime_plugin
+
+# ===============================================================================
+# Diagnostic logging — shared file with the server, distinguished by logger name
+# ===============================================================================
+
+_LOG_FILE = os.path.expanduser("~/.claude/sublime_review_server.log")
+log = logging.getLogger("plugin")
+log.setLevel(logging.INFO)
+log.propagate = False
+if not log.handlers:
+    try:
+        os.makedirs(os.path.dirname(_LOG_FILE), exist_ok=True)
+        _h = logging.FileHandler(_LOG_FILE)
+        _h.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+        ))
+        log.addHandler(_h)
+    except Exception:
+        pass
 
 # ===============================================================================
 # Settings
@@ -293,7 +313,7 @@ class _ReviewPanel(object):
         self._view = v
         return v
 
-    def show(self, review, compact=False):
+    def show(self, review, compact=False, has_inline=False):
         try:
             # Show the panel first so find_output_panel returns the live view
             self._window.run_command("show_panel", {"panel": "output." + PANEL_NAME})
@@ -312,13 +332,16 @@ class _ReviewPanel(object):
             pos     = review.get("queue_position", 1)
             total   = review.get("queue_total", 1)
             color   = _agent_color(review.get("session_id", ""))
+            can_inline = tool in ("Edit", "MultiEdit")
+            inline_hint = ("   [S] Full diff" if has_inline else "   [S] Inline") if can_inline else ""
             header = (
                 "\n"
                 "  {agent}  |  {tool}  |  {pos}/{total} in queue\n"
                 "  {fp}\n"
-                "  [Enter] Accept   [Escape] Reject   [Tab] Next\n"
+                "  [Enter] Accept   [Escape] Reject   [Tab] Next{inline_hint}\n"
                 "\n"
-            ).format(agent=agent, tool=tool, pos=pos, total=total, fp=fp)
+            ).format(agent=agent, tool=tool, pos=pos, total=total, fp=fp,
+                     inline_hint=inline_hint)
 
             text = header if compact else header + _build_diff(review) + "\n"
 
@@ -545,15 +568,26 @@ body {
 </style>"""
 
 
+_DASH_SHEET_ID_KEY = "sublime_agents_dashboard_sheet_id"
+_DASH_LAYOUT_KEY   = "sublime_agents_dashboard_saved_layout"
+
+
 class _DashboardView(object):
-    """Manages the agent dashboard as an HTML sheet in a right column."""
+    """Manages the agent dashboard as an HTML sheet in a right column.
+
+    Sheet identity is stored in window.settings() so the view can reattach
+    to its sheet after a package reload (HtmlSheet has no backing view, so
+    we can't stamp a marker setting on it).
+    """
 
     def __init__(self, window):
         self._window       = window
         self._sheet        = None
         self._agents       = {}
-        self._saved_layout = None
+        self._saved_layout = window.settings().get(_DASH_LAYOUT_KEY)
         self._timer_gen    = 0
+        # If the dashboard was open before a reload, reattach now.
+        self._reattach()
 
     # ── Public ──────────────────────────────────────────────────────────────
 
@@ -568,10 +602,12 @@ class _DashboardView(object):
             self._window.focus_group(0)
             return
         self._saved_layout = self._window.get_layout()
+        self._window.settings().set(_DASH_LAYOUT_KEY, self._saved_layout)
         self._window.set_layout(_LAYOUT_TWO_COL)
         self._sheet = self._window.new_html_sheet(
             "Agents", self._build_html(), group=1,
         )
+        self._window.settings().set(_DASH_SHEET_ID_KEY, self._sheet.id())
         sublime.set_timeout(self._apply_sheet_settings, 80)
         self._window.focus_group(0)
         self._start_timer()
@@ -594,6 +630,7 @@ class _DashboardView(object):
     def close(self):
         self._timer_gen += 1
         sheet, self._sheet = self._sheet, None
+        self._window.settings().erase(_DASH_SHEET_ID_KEY)
         if sheet is not None:
             try:
                 sheet.close()
@@ -605,6 +642,7 @@ class _DashboardView(object):
         """Called when the dashboard sheet is closed externally."""
         self._timer_gen += 1
         self._sheet = None
+        self._window.settings().erase(_DASH_SHEET_ID_KEY)
         self._restore_layout()
 
     def stop_timer(self):
@@ -613,6 +651,9 @@ class _DashboardView(object):
 
     def update(self, agents):
         self._agents = agents
+        log.info("dashboard.update window=%d: %d agent(s) [%s]",
+                 self._window.id(), len(agents),
+                 ", ".join(s[:6] for s in sorted(agents.keys())))
         # set_contents must be called on the main thread
         sublime.set_timeout(self._refresh, 0)
 
@@ -624,19 +665,30 @@ class _DashboardView(object):
         if self._is_open():
             try:
                 self._sheet.set_contents(self._build_html())
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("dashboard set_contents failed: %s", e)
+        else:
+            log.info("dashboard._refresh window=%d: sheet not open, skipping render",
+                     self._window.id())
 
     def _reattach(self):
+        target_id = self._window.settings().get(_DASH_SHEET_ID_KEY)
+        if target_id is None:
+            return
         for sheet in self._window.sheets():
             try:
-                v = sheet.view()
-                if v and v.settings().get("sublime_agents_dashboard"):
+                if sheet.id() == target_id:
                     self._sheet = sheet
+                    log.info("dashboard reattached window=%d sheet=%d",
+                             self._window.id(), target_id)
                     self._start_timer()
                     return
             except Exception:
                 pass
+        # Marker is stale — sheet was closed externally
+        log.info("dashboard reattach window=%d: sheet %d no longer exists, clearing marker",
+                 self._window.id(), target_id)
+        self._window.settings().erase(_DASH_SHEET_ID_KEY)
 
     # ── Private ─────────────────────────────────────────────────────────────
 
@@ -652,6 +704,7 @@ class _DashboardView(object):
     def _restore_layout(self):
         if self._saved_layout is not None:
             layout, self._saved_layout = self._saved_layout, None
+            self._window.settings().erase(_DASH_LAYOUT_KEY)
             sublime.set_timeout(lambda: self._window.set_layout(layout), 100)
 
     def _start_timer(self):
@@ -907,6 +960,7 @@ class _Manager(object):
         t.start()
 
     def _on_open(self):
+        log.info("WS connected window=%d", self._window.id())
         sublime.set_timeout(
             lambda: sublime.status_message("SublimeReview: connected"), 0)
 
@@ -914,28 +968,40 @@ class _Manager(object):
         try:
             msg = json.loads(raw)
         except Exception:
+            log.warning("WS recv: invalid JSON (%d bytes)", len(raw))
             return
         t = msg.get("type")
         if t == "review_request":
+            log.info("WS recv review_request review=%s", msg.get("review_id", "?"))
             sublime.set_timeout(lambda: self._enqueue(msg), 0)
         elif t == "review_cancelled":
             rid = msg.get("review_id")
+            log.info("WS recv review_cancelled review=%s", rid)
             sublime.set_timeout(lambda: self._cancel(rid), 0)
         elif t == "lock_update":
             lk = msg.get("locks", {})
+            log.info("WS recv lock_update: %d lock(s)", len(lk))
             sublime.set_timeout(lambda: self._ind.apply(lk), 0)
         elif t == "queue_update":
             n = msg.get("queue_total", 0)
+            log.info("WS recv queue_update: total=%d", n)
             sublime.set_timeout(lambda: self._ind.set_status(n), 0)
         elif t == "agent_update":
             ag = msg.get("agents", {})
+            sids = sorted(ag.keys())
+            log.info("WS recv agent_update: %d agent(s) [%s]",
+                     len(sids), ", ".join(s[:6] for s in sids))
             sublime.set_timeout(lambda: self._dashboard.update(ag), 0)
+        else:
+            log.warning("WS recv unknown type=%s", t)
 
     def _on_err(self, e):
+        log.warning("WS error window=%d: %s", self._window.id(), e)
         sublime.set_timeout(
             lambda: sublime.status_message("SublimeReview: error - " + str(e)), 0)
 
     def _on_close(self):
+        log.info("WS closed window=%d (clearing dashboard)", self._window.id())
         sublime.set_timeout(lambda: self._dashboard.update({}), 0)
         if self._running and _auto_reconnect():
             sublime.set_timeout_async(self._reconnect, _reconnect_delay() * 1000)
@@ -995,13 +1061,17 @@ class _Manager(object):
         self._inline.clear()
         tool = review.get("tool_name", "")
         if tool in ("Edit", "MultiEdit"):
-            ok = self._inline.show(review)
-            self._panel.show(review, compact=ok)
-            if not ok:
-                fp = review.get("file_path", "")
-                loading = self._window.find_open_file(fp)
-                if loading is not None and loading.is_loading():
-                    self._wait_for_inline(loading, review, 0)
+            fp = review.get("file_path", "")
+            already_open = self._window.find_open_file(fp) is not None
+            if already_open:
+                ok = self._inline.show(review)
+                self._panel.show(review, compact=ok, has_inline=ok)
+                if not ok:
+                    loading = self._window.find_open_file(fp)
+                    if loading is not None and loading.is_loading():
+                        self._wait_for_inline(loading, review, 0)
+            else:
+                self._panel.show(review, compact=False, has_inline=False)
         else:
             self._panel.show(review, compact=False)
         # focus_view() in _inline.show() is async on Linux and its effect can
@@ -1027,7 +1097,7 @@ class _Manager(object):
                 self._active.get("review_id") == review.get("review_id")
             )
         if still_active and self._inline.show(review):
-            self._panel.show(review, compact=True)
+            self._panel.show(review, compact=True, has_inline=True)
 
     def show_current(self):
         """Re-render the active review — call after anything that hides the panel."""
@@ -1035,12 +1105,8 @@ class _Manager(object):
             review = self._active
         if review is None:
             return
-        tool = review.get("tool_name", "")
-        if tool in ("Edit", "MultiEdit"):
-            ok = self._inline.show(review)
-            self._panel.show(review, compact=ok)
-        else:
-            self._panel.show(review, compact=False)
+        inline_active = self._inline._phantom_set is not None
+        self._panel.show(review, compact=inline_active, has_inline=inline_active)
 
     def has_pending(self):
         with self._mu:
@@ -1135,6 +1201,32 @@ class SublimeReviewShowCommand(sublime_plugin.WindowCommand):
     def is_enabled(self):
         m = _managers.get(self.window.id())
         return m is not None and m.has_pending()
+
+
+class SublimeReviewToggleInlineCommand(sublime_plugin.WindowCommand):
+    def run(self):
+        m = _manager(self.window)
+        if not m:
+            return
+        with m._mu:
+            review = m._active
+        if review is None or review.get("tool_name", "") not in ("Edit", "MultiEdit"):
+            return
+        if m._inline._phantom_set is not None:
+            m._inline.clear()
+            m._panel.show(review, compact=False, has_inline=False)
+        else:
+            ok = m._inline.show(review)
+            if ok:
+                m._panel.show(review, compact=True, has_inline=True)
+            else:
+                fp = review.get("file_path", "")
+                loading = m._window.find_open_file(fp)
+                if loading is not None and loading.is_loading():
+                    m._wait_for_inline(loading, review, 0)
+                else:
+                    sublime.status_message("SublimeReview: could not show inline diff")
+        self.window.run_command("show_panel", {"panel": "output." + PANEL_NAME})
 
 
 class SublimeReviewUnlockFileCommand(sublime_plugin.WindowCommand):

@@ -39,7 +39,7 @@ LOCK_TIMEOUT = 600     # seconds before an unresolved lock is force-released
 REVIEW_TIMEOUT = 300   # seconds before a pending review is auto-allowed
 AGENT_TTL = 1800       # seconds of inactivity before an active agent is removed from the dashboard
 AGENT_FINISHED_TTL = 30  # seconds before a "finished" (SessionEnd) agent is removed
-LOG_FILE = "~/.claude/sublime_review_server.log"
+LOG_FILE = os.path.expanduser("~/.claude/sublime_review_server.log")
 AUDIT_LOG_PATH = os.path.expanduser("~/.local/share/sublime-agents/audit.jsonl")
 
 # ─── Hook management ─────────────────────────────────────────────────────────
@@ -194,14 +194,22 @@ _audit_lock = Lock()
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
+try:
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    _file_handler = logging.FileHandler(LOG_FILE)
+except Exception:
+    _file_handler = None
+
+_handlers = [logging.StreamHandler()]
+if _file_handler is not None:
+    _handlers.append(_file_handler)
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-    ],
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=_handlers,
 )
-log = logging.getLogger("sublime_review_server")
+log = logging.getLogger("server")
 
 
 # ─── Audit log ───────────────────────────────────────────────────────────────
@@ -229,6 +237,16 @@ def broadcast_ws(message: dict) -> None:
     """Schedule a WS broadcast from any thread."""
     if ws_loop is None:
         return
+    msg_type = message.get("type", "?")
+    if msg_type == "agent_update":
+        sids = sorted(message.get("agents", {}).keys())
+        log.info("broadcast agent_update -> %d client(s): [%s]",
+                 len(ws_clients), ", ".join(s[:6] for s in sids))
+    elif msg_type == "lock_update":
+        log.info("broadcast lock_update -> %d client(s): %d lock(s)",
+                 len(ws_clients), len(message.get("locks", {})))
+    else:
+        log.info("broadcast %s -> %d client(s)", msg_type, len(ws_clients))
     asyncio.run_coroutine_threadsafe(_broadcast(json.dumps(message)), ws_loop)
 
 
@@ -658,6 +676,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 "queue": review_queue,
                 "pending_reviews": len(pending_reviews),
                 "ws_clients": len(ws_clients),
+                "agents": _agent_snapshot(),
             })
 
 

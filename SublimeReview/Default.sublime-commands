@@ -26,5 +26,9 @@
     {
         "caption": "SublimeReview: Toggle Agent Dashboard",
         "command": "sublime_agents_dashboard"
+    },
+    {
+        "caption": "SublimeReview: Toggle Inline Diff",
+        "command": "sublime_review_toggle_inline"
     }
 ]

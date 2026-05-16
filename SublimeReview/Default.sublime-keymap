@@ -13,5 +13,10 @@
         "keys": ["tab"],
         "command": "sublime_review_next",
         "context": [{"key": "sublime_review_panel_focused"}]
+    },
+    {
+        "keys": ["s"],
+        "command": "sublime_review_toggle_inline",
+        "context": [{"key": "sublime_review_panel_focused"}]
     }
 ]
