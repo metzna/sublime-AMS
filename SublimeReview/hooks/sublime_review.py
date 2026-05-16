@@ -71,6 +71,13 @@ def main() -> None:
     if not os.path.isabs(file_path):
         file_path = os.path.join(cwd, file_path)
 
+    # ── Skip review for files under ~/.claude/ ────────────────────────────────
+    # Memory, plans, settings, and other Claude-internal state live here.
+    # The user does not want to approve every memory write or plan update.
+    claude_dir = os.path.expanduser("~/.claude")
+    if file_path == claude_dir or file_path.startswith(claude_dir + os.sep):
+        sys.exit(0)
+
     # ── Build the review payload ───────────────────────────────────────────────
     payload: dict = {
         "session_id": session_id,
